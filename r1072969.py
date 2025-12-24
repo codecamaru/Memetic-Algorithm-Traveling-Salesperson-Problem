@@ -1,9 +1,7 @@
 # Minimal evolutionary algorithm for directed TSP with possible ∞ (no-edge) distances.
-# Conforms to the KU Leuven template and Reporter interface.
-# Heavily annotated to serve as a solid base for your individual phase.
-
 import Reporter
 import numpy as np
+import matplotlib.pyplot as plt
 
 #import psutil
 #import os
@@ -13,16 +11,16 @@ import numpy as np
 class r1072969:
     def __init__(self,
                  rng_seed: int | None = None,
-                 mu: int | None = None,            # population size (optional: auto if None)
+                 mu: int | None = None,            # population size (optional: auto if None) ¿?
                  lamb: int | None = None,          # offspring per generation (optional: auto if None)
                  k_tournament: int | None = None,  # tournament size (optional: auto if None)
-                 mutation_rate: float = 0.9,       # probability to mutate a selected parent
-                 crossover_rate: float = 0.9,      # probability to recombine two parents
+                 mutation_rate: float = 0.9,       # probability to mutate a selected parent ¿?
+                 crossover_rate: float = 0.9,      # probability to recombine two parents ¿?
                  feasible_retry: int = 20          # retries to obtain a feasible variation
                  ):
         """
-        Parameters are modest defaults aimed at n in [100..1000] with ~5 min CPU budget.
-        You can tune these later (e.g., for your experiments in session 3).
+        ¿Parameters are modest defaults aimed at n in [100..1000] with ~5 min CPU budget.
+        You can tune these later (e.g., for your experiments in session 3).?
         """
         self.reporter = Reporter.Reporter(self.__class__.__name__)
         self.rng = np.random.default_rng(rng_seed)
@@ -75,6 +73,13 @@ class r1072969:
 
     def _randomized_greedy_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 200) -> np.ndarray:
         """
+        1. Precompute nearest neighbors for every city among feasible targets, sorted by distance for speed.
+        2.Try up to max_restarts; in each attempt:
+            Pick a random start city.
+            Build the tour greedily: at each step, choose among the nearest feasible unvisited neighbors, but add a bit of randomness by sampling among the top-k (with k ≤ 5) to improve diversity and avoid traps.
+            If the greedy sequence finishes, ensure the cycle closes (last → first is finite). If not, try a simple swap fix near the end.
+        3. If all restarts fail, raise an error.
+        
         Construct a *feasible* tour using a randomized greedy heuristic:
         - pick a random start,
         - repeatedly choose the nearest feasible next city with a small randomization (biased choice),
@@ -128,6 +133,60 @@ class r1072969:
                             return tmp
             # else restart
         raise ValueError("Failed to construct a feasible tour with randomized-greedy.")
+    #----
+    def _random_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 500) -> np.ndarray:
+        """
+        Construct a feasible tour using a random walk constrained by feasibility (M):
+        - pick a random start,
+        - repeatedly choose a random feasible unvisited next city (uniform choice),
+        - if stuck, restart,
+        - ensure last->first is finite; try a simple end-fix via swapping if needed.
+        Returns a permutation that induces only finite edges (including last->first), or raises ValueError.
+        """
+        n = D.shape[0]
+
+        # Precompute feasible neighbors (unsorted; random will sample uniformly)
+        neighbors = []
+        for i in range(n):
+            js = np.where(M[i])[0]
+            neighbors.append(js if js.size else np.array([], dtype=int))
+
+        for _ in range(max_restarts):
+            used = np.zeros(n, dtype=bool)
+            tour = np.empty(n, dtype=int)
+
+            start = self.rng.integers(0, n)
+            tour[0] = start
+            used[start] = True
+
+            feasible = True
+            for pos in range(1, n):
+                curr = tour[pos - 1]
+                cand = neighbors[curr][~used[neighbors[curr]]]
+                if cand.size == 0:
+                    feasible = False
+                    break
+                # Uniform random among all feasible unvisited neighbors
+                next_city = self.rng.choice(cand)
+                tour[pos] = next_city
+                used[next_city] = True
+
+            if feasible:
+                # Close the cycle: last -> first must be finite
+                if np.isfinite(D[tour[-1], tour[0]]):
+                    return tour
+                # Try a simple end-fix: swap last with a position that fixes closure
+                for swap_pos in range(1, n - 1):
+                    tmp = tour.copy()
+                    tmp[-1], tmp[swap_pos] = tmp[swap_pos], tmp[-1]
+                    if np.isfinite(D[tmp[-1], tmp[0]]):
+                        # also check edges around swapped position remained finite
+                        if (np.isfinite(D[tmp[swap_pos - 1], tmp[swap_pos]])
+                            and np.isfinite(D[tmp[swap_pos], tmp[swap_pos + 1]])):
+                            return tmp
+            # else restart and try again
+        raise ValueError("Failed to construct a random feasible tour.")
+    #-----
 
     # ==========================
     # ---- Selection (k-t) -----
@@ -264,22 +323,48 @@ class r1072969:
         n = D.shape[0]
         M = self._finite_outgoing_mask(D)
 
+        # Carol: ¿esto es realmente necesario lo de auto?
         # Auto-parameterization (safe defaults for 100..1000)
         mu = self._mu_in if self._mu_in is not None else int(np.clip(n // 10, 20, 80))
         lamb = self._lamb_in if self._lamb_in is not None else mu
         k = self._k_in if self._k_in is not None else int(np.clip(7, 2, mu))
 
         # ---- Initialize a feasible population ----
+        # Carol: vamos a probar a aplicar el smart initialisation solo a una parte de la población inicial, y lo otro completamente aleatorio pero feasible. Luego puedes probar con completamente aleatorio instead.
         population: list[np.ndarray] = []
-        tries, target = 0, mu
-        while len(population) < target and tries < 10_000:
-            tries += 1
+#-----
+        # Compute counts
+        num_greedy = max(1, int(round(0.20 * mu)))        # ensure at least 1 greedy
+        num_random = mu - num_greedy
+    
+        greedy_tries, random_tries = 0, 0
+        max_total_tries = 10_000
+
+        # First: inject high-quality greedy tours (~20%)
+        while len(population) < num_greedy and (greedy_tries + random_tries) < max_total_tries:
+            greedy_tries += 1
             try:
                 tour = self._randomized_greedy_feasible(D, M)
                 population.append(tour)
             except ValueError:
                 # Highly constrained instance; keep trying
                 continue
+
+        # Second: fill remaining with random feasible (~80%)
+        while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
+            random_tries += 1
+            try:
+                tour = self._random_feasible(D, M)
+                population.append(tour)
+            except ValueError:
+                # If random feasible fails, keep trying; may be highly constrained
+                continue
+
+        # Fallback: as a last resort, fill the rest with pure random permutations (may be infeasible)
+        # EA will attempt to repair via variation; this should rarely happen.
+        while len(population) < mu:
+            population.append(self.rng.permutation(n))
+# --------
         if len(population) == 0:
             # As a last resort, fall back to random permutations (may be infeasible),
             # but EA will attempt to repair via variation; this should rarely happen.
@@ -290,6 +375,28 @@ class r1072969:
         best_idx = int(np.argmin(fitness))
         best_tour = population[best_idx].copy()
         best_fit = float(fitness[best_idx])
+        
+        #----
+        # ---------- Diversity tracking setup ----------
+        diversity_counts: list[int] = []
+
+        def _count_unique_edges_in_population(pop: list[np.ndarray], Dmat: np.ndarray) -> int:
+            """
+            Count the number of unique finite directed edges i->j present across the population.
+            Directed matters (i->j is different from j->i).
+            """
+            uniq: set[tuple[int, int]] = set()
+            for t in pop:
+                idx = t
+                nxt = np.roll(idx, -1)  # last -> first closes the cycle
+                # Only count edges with finite cost (feasible directed arcs)
+                finite_mask = np.isfinite(Dmat[idx, nxt])
+                # Add directed pairs for finite edges only
+                for i, j, f in zip(idx, nxt, finite_mask):
+                    if f:
+                        uniq.add((int(i), int(j)))
+            return len(uniq)
+        #----
 
         # ===== Evolutionary loop =====
         yourConvergenceTestsHere = True
@@ -358,12 +465,33 @@ class r1072969:
             meanObjective = float(np.mean(fitness))
             bestObjective = float(best_fit)
             bestSolution = best_tour.astype(int)
+            
+            #----
+            # ---------- Diversity (unique directed edges) ----------
+            diversity_counts.append(_count_unique_edges_in_population(population, D))
+            #----
 
             # Leave the next three lines as they are (per assignment)
             timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
             if timeLeft < 0:
                 break
 
+        #-------
+        
+        # ---------- Diversity plot ----------
+        if len(diversity_counts) > 0:
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            x = np.arange(1, len(diversity_counts) + 1)
+            ax.plot(x, diversity_counts, lw=2, color='tab:blue')
+            ax.set_xlabel("Generation")
+            ax.set_ylabel("Unique directed edges in population")
+            ax.set_title("Population diversity (unique edges) over generations")
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig("diversity_evolution.png", dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+        #-------
         return 0
 
 
@@ -375,7 +503,7 @@ if __name__ == '__main__':
 
     #start_time = time.perf_counter()
 
-    a = r1072969(mu=20, lamb=270, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
+    a = r1072969(mu=200, lamb=270, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
 
     a.optimize("./tour50.csv")
     
