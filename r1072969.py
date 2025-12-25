@@ -646,10 +646,10 @@ class r1072969:
         return int(winner)
     
     @staticmethod
-    def _compute_fitness_population(pop: list[np.ndarray], D: np.ndarray) -> np.ndarray:
-        """Vector-ish evaluation for a list of tours -> array of fitnesses (lower is better)."""
-        # Keep it simple; loop is fine because evaluate is O(n) anyway.
-        return np.array([r1072969._tour_length(t, D) for t in pop], dtype=float)
+    def _compute_fitness_population(population: list[np.ndarray], D: np.ndarray) -> np.ndarray:
+        """ Compute objective function for each tour 
+            Returns an array of fitnesses """
+        return np.array([r1072969._tour_length(t, D) for t in population], dtype=float)
     
     # ===========================
     # ---- Diversity helpers ----
