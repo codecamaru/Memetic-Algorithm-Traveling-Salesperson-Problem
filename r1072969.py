@@ -363,7 +363,7 @@ class r1072969:
         OX crossover with a light repair attempt: if infeasible, try a few random re-shuffles
         around problematic edges; otherwise fall back to the fitter parent.
         """
-        ops = (self._crossover_OX, self._crossover_CX, self._crossover_ERX, self._crossover_PMX)
+        ops = (self._crossover_OX, self._crossover_ERX)
         op = self.rng.choice(ops)
         child = op(p1, p2) # habrá que cambiar esto maybe para saber cuál coger
         if np.isfinite(self._tour_length(child, D)):
@@ -391,8 +391,7 @@ class r1072969:
         # Fallback: return the better of the two parents
         return p1  # caller should pass parents in (best, other) order
 
-    def _crossover_CX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
-        """
+    """def _crossover_CX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
         Cycle Crossover (CX): decomposes positions into cycles by mapping p2's values
         back to their indices in p1. Alternates cycles between parents to produce
         a valid permutation. Not guaranteed feasible in directed sense.
@@ -403,7 +402,6 @@ class r1072969:
 
         Returns:
             child: A valid permutation (np.ndarray of dtype=int).
-        """
         n = p1.size
         child = -np.ones(n, dtype=int)
 
@@ -441,7 +439,7 @@ class r1072969:
                 child[cyc] = p2[cyc]
             use_p1 = not use_p1  # alternate parent for next cycle
 
-        return child
+        return child"""
 
     
     def _crossover_OX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
@@ -544,8 +542,8 @@ class r1072969:
 
         return child
 
-    def _crossover_PMX(self,parent1: Sequence[Hashable],parent2: Sequence[Hashable],cut_points: Optional[Tuple[int, int]] = None,) -> Tuple[List[Hashable], List[Hashable]]:
-        """
+    """def _crossover_PMX(self,parent1: Sequence[Hashable],parent2: Sequence[Hashable],cut_points: Optional[Tuple[int, int]] = None,) -> Tuple[List[Hashable], List[Hashable]]:
+        
         Perform PMX (Partially Mapped Crossover) on two permutation parents.
         Args:
             parent1: First parent (permutation of unique, hashable genes).
@@ -557,7 +555,7 @@ class r1072969:
         Raises:
             ValueError: If parents have different lengths, are not permutations,
                         or cut_points are invalid.
-        """
+        
         n = len(parent1)
         if len(parent2) != n:
             raise ValueError("Parents must have the same length.")
@@ -572,8 +570,8 @@ class r1072969:
             raise ValueError("Parents must contain the exact same set of genes.")
 
         # Choose/validate crossover points
-        if cut_points is None:
-            c1, c2 = sorted(self.rng.sample(range(n), 2))
+        if cut_points is None:            
+            c1, c2 = np.sort(self.rng.choice(n, size=2, replace=False))
         else:
             c1, c2 = cut_points
             if not (0 <= c1 < c2 < n):
@@ -582,42 +580,55 @@ class r1072969:
         return self._pmx_pair(parent1, parent2, c1, c2)
 
     def _pmx_pair(self, p1: Sequence[Hashable], p2: Sequence[Hashable], c1: int, c2: int) -> Tuple[List[Hashable], List[Hashable]]:
-        """
+        
         Build both PMX offspring using inclusive indices [c1..c2].
-        """
+        Assumes p1 and p2 are permutations (no duplicates).
+        
         n = len(p1)
+        assert len(p2) == n and 0 <= c1 <= c2 < n
+
+        # Optional: normalize NumPy integer types to Python ints to avoid mixed-type surprises
+        def _normalize(seq):
+            return [int(x) if isinstance(x, np.integer) else x for x in seq]
+
+        p1 = _normalize(p1)
+        p2 = _normalize(p2)
+
         child1 = [None] * n
         child2 = [None] * n
 
-        # 1) Copy the crossover segments directly
+        # 1) Copy the crossover segments directly (inclusive c1..c2)
         child1[c1 : c2 + 1] = p1[c1 : c2 + 1]
         child2[c1 : c2 + 1] = p2[c1 : c2 + 1]
 
         # 2) Build mapping dictionaries for conflict resolution chains
-        # For child1, we import from p2 and map through p2->p1 on the segment.
-        map_p2_to_p1 = {p2[i]: p1[i] for i in range(c1, c2 + 1)}
-        # For child2, we import from p1 and map through p1->p2 on the segment.
+        # For child1: conflicts are against p1's segment => use p1 -> p2 mapping
         map_p1_to_p2 = {p1[i]: p2[i] for i in range(c1, c2 + 1)}
+        # For child2: conflicts are against p2's segment => use p2 -> p1 mapping
+        map_p2_to_p1 = {p2[i]: p1[i] for i in range(c1, c2 + 1)}
 
-        def fill_outside_segment(child: List[Hashable], donor: Sequence[Hashable], mapping: dict):
-            """
-            Fill positions outside [c1..c2] from donor, resolving duplicates
-            by following the mapping chain until an unused gene is found.
-            """
-            segment = set(child[c1 : c2 + 1])  # Faster membership checks
-            for i in range(n):
-                if c1 <= i <= c2:
-                    continue
-                gene = donor[i]
-                # Follow conflict chain if gene already in the copied segment
-                while gene in segment:
-                    gene = mapping[gene]
-                child[i] = gene
+        seg1 = set(child1[c1 : c2 + 1])  # values copied from p1
+        seg2 = set(child2[c1 : c2 + 1])  # values copied from p2
 
-        fill_outside_segment(child1, p2, map_p2_to_p1)
-        fill_outside_segment(child2, p1, map_p1_to_p2)
+        # 3) Fill positions outside the segment
+        for i in range(n):
+            if c1 <= i <= c2:
+                continue
 
-        return child1, child2
+            # Fill child1 from p2, resolving conflicts via p1->p2 mapping chains
+            g = p2[i]
+            while g in seg1:
+                g = map_p1_to_p2[g]
+            child1[i] = g
+
+            # Fill child2 from p1, resolving conflicts via p2->p1 mapping chains
+            g = p1[i]
+            while g in seg2:
+                g = map_p2_to_p1[g]
+            child2[i] = g
+
+        return child1, child2"""
+
     
     # ===========================
     # ---- Selection helpers ----
