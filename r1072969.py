@@ -14,9 +14,9 @@ import random
 class r1072969:
     def __init__(self,
                  rng_seed: int | None = None,
-                 mu: int | None = None,            # population size (optional: auto if None) ¿?
-                 lamb: int | None = None,          # offspring per generation (optional: auto if None)
-                 k_tournament: int | None = None,  # tournament size (optional: auto if None)
+                 mu: int = 100,                         # population size (optional: auto if None) ¿?
+                 lamb: int = 100,                       # offspring per generation (optional: auto if None)
+                 k_tournament: int = 3,                 # tournament size (optional: auto if None)
                  mutation_rate: float = 0.9,       # probability to mutate a selected parent ¿?
                  crossover_rate: float = 0.9,      # probability to recombine two parents ¿?
                  feasible_retry: int = 20          # retries to obtain a feasible variation
@@ -29,17 +29,204 @@ class r1072969:
         self.rng = np.random.default_rng(rng_seed)
 
         # Hyperparameters (may be auto-set after reading instance size)
-        self._mu_in = mu
-        self._lamb_in = lamb
-        self._k_in = k_tournament
+        self.mu = mu
+        self.lamb = lamb
+        self.k_tournament = k_tournament
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
         self.feasible_retry = feasible_retry
+        
+    # ---- Initialisation ----
+    def initialisation(self, distanceMatrix: np.ndarray) -> np.ndarray:
+        D = distanceMatrix
+        n = D.shape[0]
+        M = self._finite_outgoing_mask(D)
 
-    # ===============================
-    # ---- Initialization ----
-    # ===============================
+        # Carol: ¿esto es realmente necesario lo de auto?
+        # Auto-parameterization (safe defaults for 100..1000)
+        mu = self.mu
+        lamb = self.lamb
+        k = self.k_tournament
 
+        # ---- Initialize a feasible population ----
+        # Carol: vamos a probar a aplicar el smart initialisation solo a una parte de la población inicial, y lo otro completamente aleatorio pero feasible. Luego puedes probar con completamente aleatorio instead.
+        
+        population: list[np.ndarray] = []
+
+        # Compute counts
+        num_greedy = max(1, int(round(0.20 * mu)))        # ensure at least 1 greedy
+        num_random = mu - num_greedy
+    
+        greedy_tries, random_tries = 0, 0
+        max_total_tries = 10_000
+        #### INITIALISATION ####
+        # First: inject high-quality greedy tours (~20%)
+        while len(population) < num_greedy and (greedy_tries + random_tries) < max_total_tries:
+            greedy_tries += 1 # MIRA BIEN A VER QUÉ ES ESTO DE LOS TRIES 
+            try:
+                tour = self._randomized_greedy_initialisation_feasible(D, M)
+                population.append(tour)
+            except ValueError:
+                # Highly constrained instance; keep trying
+                continue
+
+        # Second: fill remaining with random feasible (~80%)
+        while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
+            random_tries += 1
+            try:
+                tour = self._random_initialisation_feasible(D, M)
+                population.append(tour)
+            except ValueError:
+                # If random feasible fails, keep trying; may be highly constrained
+                continue
+
+        # Fallback: as a last resort, fill the rest with pure random permutations (may be infeasible)
+        # EA will attempt to repair via variation; this should rarely happen.
+        while len(population) < mu:
+            population.append(self.rng.permutation(n))
+        
+        return population
+            
+    # ---- Selection ----
+    # pon los metodos nuevos tuyos aquí  y en el main loop apenas será llamar a estos, y argupa aquí todo en cada uno
+    def selection(self, population: np.ndarray, fitness: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        k = self.k_tournament
+        mu = self.mu
+        # Parent selection (k-tournament)
+        p1_idx = self._tournament_select_idx(fitness, k)
+        p2_idx = self._tournament_select_idx(fitness, k)
+        while p2_idx == p1_idx and mu > 1:
+            p2_idx = self._tournament_select_idx(fitness, k)
+        p1, p2 = population[p1_idx], population[p2_idx]
+
+        # Ensure p1 is the better parent (helps in fallback decisions)
+        if fitness[p2_idx] < fitness[p1_idx]:
+            p1, p2 = p2, p1
+    
+    # ---- Crossover ----
+
+    # ---- Mutation ----
+    
+    # ---- Elimination ----
+
+
+    # ==========================
+    # ---- Main optimize()  ----
+    # ==========================
+
+    def optimize(self, filename: str):
+        # ---- Read distance matrix exactly as in template (do not change) ----
+        file = open(filename)
+        distanceMatrix = np.loadtxt(file, delimiter=",")
+        file.close()
+        
+        D = distanceMatrix
+
+        # --- Initialisation ---
+        population = self.initialisation(D)
+
+        fitness = self._evaluate_population(population, D)
+        best_idx = int(np.argmin(fitness))
+        best_tour = population[best_idx].copy()
+        best_fit = float(fitness[best_idx])
+        
+        diversity_counts: list[int] = []
+        
+        mu = self.mu
+        lamb = self.lamb
+        k = self.k_tournament
+
+        # ===== Evolutionary loop =====
+        yourConvergenceTestsHere = True
+        while yourConvergenceTestsHere:
+            # ---------- Create offspring ----------
+            offspring: list[np.ndarray] = []
+
+            # Recombination + Mutation to produce λ children
+            while len(offspring) < lamb:
+                # --- Selection --- (k-tournament)
+                p1, p2 = self.selection(population, fitness)
+
+                # Crossover with probability
+                if self.rng.random() < self.crossover_rate:
+                    child = self._recombine_feasible(p1, p2, D)
+                else:
+                    child = p1.copy()
+
+                # Mutation with probability
+                if self.rng.random() < self.mutation_rate:
+                    child = self._mutate_feasible(child, D)
+
+                offspring.append(child)
+
+            # ---------- Evaluate offspring ----------
+            off_fit = self._evaluate_population(offspring, D)
+
+            # ---------- (μ+λ) Elitist survival with duplicate filtering ----------
+            combined = population + offspring
+            combined_fit = np.concatenate((fitness, off_fit))
+
+            # Sort by fitness (ascending), keep feasible first (np.inf automatically sinks to end)
+            order = np.argsort(combined_fit, kind='mergesort')
+            sorted_pop = [combined[i] for i in order]
+            sorted_fit = combined_fit[order]
+
+            # Remove duplicates to preserve some diversity
+            sorted_pop = self._unique_by_tuple(sorted_pop)
+            # Recompute fitness for the filtered ordering
+            # (We can align by recomputing for safety; but reuse the sorted order's fitness where possible)
+            # Simpler: recompute
+            sorted_fit = self._evaluate_population(sorted_pop, D)
+
+            # Keep top μ
+            population = sorted_pop[:mu]
+            fitness = sorted_fit[:mu]
+
+            # ---------- Track best ----------
+            gen_best_idx = int(np.argmin(fitness))
+            gen_best_fit = float(fitness[gen_best_idx])
+            if gen_best_fit < best_fit:
+                best_fit = gen_best_fit
+                best_tour = population[gen_best_idx].copy()
+
+            # ---------- Reporting ----------
+            # Mean objective: use numeric mean, with infeasible counted as +∞; for CSV readability,
+            # convert to float (will print 'inf' if infeasible tours remain).
+            meanObjective = float(np.mean(fitness))
+            bestObjective = float(best_fit)
+            bestSolution = best_tour.astype(int)
+            
+            #----
+            # ---------- Diversity (unique directed edges) ----------
+            diversity_counts.append(self._count_unique_edges_in_population(population, D))
+            #----
+
+            # Leave the next three lines as they are (per assignment)
+            timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
+            if timeLeft < 0:
+                break
+
+        #-------
+        
+        # ---------- Diversity plot ----------
+        if len(diversity_counts) > 0:
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            x = np.arange(1, len(diversity_counts) + 1)
+            ax.plot(x, diversity_counts, lw=2, color='tab:blue')
+            ax.set_xlabel("Generation")
+            ax.set_ylabel("Unique directed edges in population")
+            ax.set_title("Population diversity (unique edges) over generations")
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig("diversity_evolution.png", dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+        #-------
+        return 0
+    
+    # ==========================
+    # ---- Initialisation helpers -----
+    # ==========================
     def _randomized_greedy_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 200) -> np.ndarray:
         """
         1. Precompute nearest neighbors for every city among feasible targets, sorted by distance for speed.
@@ -155,178 +342,6 @@ class r1072969:
                             return tmp
             # else restart and try again
         raise ValueError("Failed to construct a random feasible tour.")
-
-    # ---- Selection ----
-    # pon los metodos nuevos tuyos aquí  y en el main loop apenas será llamar a estos, y argupa aquí todo en cada uno
-    # ---- Crossover ----
-
-    # ---- Mutation ----
-    
-    # ---- Elimination ----
-
-
-    # ==========================
-    # ---- Main optimize()  ----
-    # ==========================
-
-    def optimize(self, filename: str):
-        # ---- Read distance matrix exactly as in template (do not change) ----
-        file = open(filename)
-        distanceMatrix = np.loadtxt(file, delimiter=",")
-        file.close()
-
-        D = distanceMatrix
-        n = D.shape[0]
-        M = self._finite_outgoing_mask(D)
-
-        # Carol: ¿esto es realmente necesario lo de auto?
-        # Auto-parameterization (safe defaults for 100..1000)
-        mu = self._mu_in if self._mu_in is not None else int(np.clip(n // 10, 20, 80))
-        lamb = self._lamb_in if self._lamb_in is not None else mu
-        k = self._k_in if self._k_in is not None else int(np.clip(7, 2, mu))
-
-        # ---- Initialize a feasible population ----
-        # Carol: vamos a probar a aplicar el smart initialisation solo a una parte de la población inicial, y lo otro completamente aleatorio pero feasible. Luego puedes probar con completamente aleatorio instead.
-        population: list[np.ndarray] = []
-#-----
-        # Compute counts
-        num_greedy = max(1, int(round(0.20 * mu)))        # ensure at least 1 greedy
-        num_random = mu - num_greedy
-    
-        greedy_tries, random_tries = 0, 0
-        max_total_tries = 10_000
-
-        # First: inject high-quality greedy tours (~20%)
-        while len(population) < num_greedy and (greedy_tries + random_tries) < max_total_tries:
-            greedy_tries += 1 # MIRA BIEN A VER QUÉ ES ESTO DE LOS TRIES 
-            try:
-                tour = self._randomized_greedy_initialisation_feasible(D, M)
-                population.append(tour)
-            except ValueError:
-                # Highly constrained instance; keep trying
-                continue
-
-        # Second: fill remaining with random feasible (~80%)
-        while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
-            random_tries += 1
-            try:
-                tour = self._random_initialisation_feasible(D, M)
-                population.append(tour)
-            except ValueError:
-                # If random feasible fails, keep trying; may be highly constrained
-                continue
-
-        # Fallback: as a last resort, fill the rest with pure random permutations (may be infeasible)
-        # EA will attempt to repair via variation; this should rarely happen.
-        while len(population) < mu:
-            population.append(self.rng.permutation(n))
-# --------
-
-        fitness = self._evaluate_population(population, D)
-        best_idx = int(np.argmin(fitness))
-        best_tour = population[best_idx].copy()
-        best_fit = float(fitness[best_idx])
-        
-        #----
-        # ---------- Diversity tracking setup ----------
-        diversity_counts: list[int] = []
-        #----
-
-        # ===== Evolutionary loop =====
-        yourConvergenceTestsHere = True
-        while yourConvergenceTestsHere:
-            # ---------- Create offspring ----------
-            offspring: list[np.ndarray] = []
-
-            # Recombination + Mutation to produce λ children
-            while len(offspring) < lamb:
-                # Parent selection (k-tournament)
-                p1_idx = self._tournament_select_idx(fitness, k)
-                p2_idx = self._tournament_select_idx(fitness, k)
-                while p2_idx == p1_idx and mu > 1:
-                    p2_idx = self._tournament_select_idx(fitness, k)
-                p1, p2 = population[p1_idx], population[p2_idx]
-
-                # Ensure p1 is the better parent (helps in fallback decisions)
-                if fitness[p2_idx] < fitness[p1_idx]:
-                    p1, p2 = p2, p1
-
-                # Crossover with probability
-                if self.rng.random() < self.crossover_rate:
-                    child = self._recombine_feasible(p1, p2, D)
-                else:
-                    child = p1.copy()
-
-                # Mutation with probability
-                if self.rng.random() < self.mutation_rate:
-                    child = self._mutate_feasible(child, D)
-
-                offspring.append(child)
-
-            # ---------- Evaluate offspring ----------
-            off_fit = self._evaluate_population(offspring, D)
-
-            # ---------- (μ+λ) Elitist survival with duplicate filtering ----------
-            combined = population + offspring
-            combined_fit = np.concatenate((fitness, off_fit))
-
-            # Sort by fitness (ascending), keep feasible first (np.inf automatically sinks to end)
-            order = np.argsort(combined_fit, kind='mergesort')
-            sorted_pop = [combined[i] for i in order]
-            sorted_fit = combined_fit[order]
-
-            # Remove duplicates to preserve some diversity
-            sorted_pop = self._unique_by_tuple(sorted_pop)
-            # Recompute fitness for the filtered ordering
-            # (We can align by recomputing for safety; but reuse the sorted order's fitness where possible)
-            # Simpler: recompute
-            sorted_fit = self._evaluate_population(sorted_pop, D)
-
-            # Keep top μ
-            population = sorted_pop[:mu]
-            fitness = sorted_fit[:mu]
-
-            # ---------- Track best ----------
-            gen_best_idx = int(np.argmin(fitness))
-            gen_best_fit = float(fitness[gen_best_idx])
-            if gen_best_fit < best_fit:
-                best_fit = gen_best_fit
-                best_tour = population[gen_best_idx].copy()
-
-            # ---------- Reporting ----------
-            # Mean objective: use numeric mean, with infeasible counted as +∞; for CSV readability,
-            # convert to float (will print 'inf' if infeasible tours remain).
-            meanObjective = float(np.mean(fitness))
-            bestObjective = float(best_fit)
-            bestSolution = best_tour.astype(int)
-            
-            #----
-            # ---------- Diversity (unique directed edges) ----------
-            diversity_counts.append(self._count_unique_edges_in_population(population, D))
-            #----
-
-            # Leave the next three lines as they are (per assignment)
-            timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
-            if timeLeft < 0:
-                break
-
-        #-------
-        
-        # ---------- Diversity plot ----------
-        if len(diversity_counts) > 0:
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            x = np.arange(1, len(diversity_counts) + 1)
-            ax.plot(x, diversity_counts, lw=2, color='tab:blue')
-            ax.set_xlabel("Generation")
-            ax.set_ylabel("Unique directed edges in population")
-            ax.set_title("Population diversity (unique edges) over generations")
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig("diversity_evolution.png", dpi=150, bbox_inches='tight')
-            plt.close(fig)
-
-        #-------
-        return 0
     
     # ==========================
     # ---- Mutation operators   -----
@@ -633,7 +648,7 @@ class r1072969:
         return child1, child2
     
     # ===========================
-    # ---- Utility functions ----
+    # ---- Selection helpers ----
     # ===========================
     
     def _tournament_select_idx(self, fitness: np.ndarray, k: int) -> int:
@@ -642,6 +657,16 @@ class r1072969:
         cand = self.rng.integers(0, n, size=k)
         winner = cand[np.argmin(fitness[cand])]
         return int(winner)
+    
+    @staticmethod
+    def _evaluate_population(pop: list[np.ndarray], D: np.ndarray) -> np.ndarray:
+        """Vector-ish evaluation for a list of tours -> array of fitnesses (lower is better)."""
+        # Keep it simple; loop is fine because evaluate is O(n) anyway.
+        return np.array([r1072969._tour_length(t, D) for t in pop], dtype=float)
+    
+    # ===========================
+    # ---- Utility functions ----
+    # ===========================
     
     @staticmethod
     def _unique_by_tuple(pop: list[np.ndarray]) -> list[np.ndarray]:
@@ -668,12 +693,6 @@ class r1072969:
         if np.isfinite(edges).all():
             return float(edges.sum())
         return float(np.inf)
-
-    @staticmethod
-    def _evaluate_population(pop: list[np.ndarray], D: np.ndarray) -> np.ndarray:
-        """Vector-ish evaluation for a list of tours -> array of fitnesses (lower is better)."""
-        # Keep it simple; loop is fine because evaluate is O(n) anyway.
-        return np.array([r1072969._tour_length(t, D) for t in pop], dtype=float)
 
     @staticmethod
     def _finite_outgoing_mask(D: np.ndarray) -> np.ndarray:
