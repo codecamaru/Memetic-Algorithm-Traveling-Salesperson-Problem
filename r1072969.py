@@ -2,7 +2,7 @@
 import Reporter
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Sequence, Tuple, List, Optional, Hashable, Dict
+from typing import Tuple, List, Dict
 from collections import Counter
 import random
 
@@ -33,6 +33,9 @@ class r1072969:
         
     # ---- Initialisation ----
     def initialisation(self, distanceMatrix: np.ndarray) -> np.ndarray:
+        """ 
+            Generate mu individuals (20% greedy, 80% random), all feasible if possible 
+        """
         D = distanceMatrix
         n = D.shape[0]
         M = self._finite_outgoing_mask(D)
@@ -71,6 +74,9 @@ class r1072969:
             
     # ---- Selection ----
     def selection(self, population: list[np.ndarray], fitness: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """ 
+            Compute k-tournament selection to pick two parents 
+        """
         k = self.k_tournament
         mu = self.mu
         # Parent selection (k-tournament)
@@ -87,6 +93,9 @@ class r1072969:
     
     # ---- Crossover ----
     def crossover(self, p1: np.ndarray, p2: np.ndarray, D: np.ndarray) -> np.ndarray:
+        """ 
+            Generate crossover_rate*lambda offsprings, the rest are copies of one parent
+        """
         if self.rng.random() < self.crossover_rate:
             child = self._recombine_feasible(p1, p2, D)
         else:
@@ -96,41 +105,42 @@ class r1072969:
 
     # ---- Mutation ----
     def mutation(self, child: np.ndarray, D: np.ndarray) -> np.ndarray:
-        # Mutation with probability
+        """ 
+            Mutate mutation_rate*lambda of the children 
+        """
         if self.rng.random() < self.mutation_rate:
             child = self._mutate_feasible(child, D)
         return child
     
     # ---- Elimination ----
     def elimination(self, joined_population: list[np.ndarray], joined_fitnesses: np.ndarray, distanceMatrix: np.ndarray) -> Tuple:
-        """ (μ+λ) Elitist survival with duplicate filtering """
+        """ 
+            (μ+λ) Elimination with duplicate filtering 
+        """
         mu = self.mu
         D = distanceMatrix
-        # Sort by fitness (ascending), keep feasible first (np.inf automatically sinks to end)
-        order = np.argsort(joined_fitnesses, kind='mergesort')
-        sorted_pop = [joined_population[i] for i in order]
-        sorted_fit = joined_fitnesses[order]
+        
+        order_indices = np.argsort(joined_fitnesses, kind='mergesort')
+        sorted_population = [joined_population[i] for i in order_indices]
+        sorted_fitnesses = joined_fitnesses[order_indices]
 
-        # Remove duplicates to preserve some diversity
-        sorted_pop = self._unique_by_tuple(sorted_pop)
+        sorted_population = self._unique_by_tuple(sorted_population) # Remove duplicates to preserve some diversity
         # Recompute fitness for the filtered ordering
-        # (We can align by recomputing for safety; but reuse the sorted order's fitness where possible)
-        # Simpler: recompute
-        sorted_fit = self._compute_fitness_population(sorted_pop, D)
+        sorted_fitnesses = self._compute_fitness_population(sorted_population, D)
 
         # Keep top μ
-        population = sorted_pop[:mu]
-        population_fitnesses = sorted_fit[:mu]
+        population = sorted_population[:mu]
+        population_fitnesses = sorted_fitnesses[:mu]
         
         return population, population_fitnesses
 
 
     # ==========================
-    # ---- Main optimize()  ----
+    # ---- Main EA Loop  ----
     # ==========================
 
     def optimize(self, filename: str):
-        # ---- Read distance matrix exactly as in template (do not change) ----
+        # Read distance matrix from file
         file = open(filename)
         distanceMatrix = np.loadtxt(file, delimiter=",")
         file.close()
@@ -175,25 +185,24 @@ class r1072969:
             # joining offspring with previous population
             joined_population = population + offspring
 
-            # ---------- Elimination ----------
+            # --- Elimination ---
             population, population_fitnesses = self.elimination(joined_population, joined_fitnesses, D)
 
-            # ---------- Track best ----------
+            # tracking best
             gen_best_idx = int(np.argmin(population_fitnesses))
             gen_best_fit = float(population_fitnesses[gen_best_idx])
             if gen_best_fit < best_fit:
                 best_fit = gen_best_fit
                 best_tour = population[gen_best_idx].copy()
 
-            # ---------- Reporting ----------
+            # reporting
             meanObjective = float(np.mean(population_fitnesses))
             bestObjective = float(best_fit)
             bestSolution = best_tour.astype(int)
             
-            # ---------- Diversity (unique directed edges) ----------
+            # track diversity (unique edges)
             diversity_counts.append(self._count_unique_edges_in_population(population, D))
 
-            # Leave the next three lines as they are (per assignment)
             timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
             if timeLeft < 0:
                 break
@@ -319,22 +328,20 @@ class r1072969:
     #  Mutation operators   
     # ==========================
     def _mutate_swap(self, tour: np.ndarray) -> np.ndarray:
+        """ 
+            Pick two indices at random and swap them
+            Return the resulting tour
+        """
         i, j = self.rng.choice(tour.size, size=2, replace=False)
         child = tour.copy()
         child[i], child[j] = child[j], child[i]
         return child
 
-    """def _mutate_insert(self, tour: np.ndarray) -> np.ndarray:
-        i, j = self.rng.choice(tour.size, size=2, replace=False)
-        if i > j:
-            i, j = j, i
-        child = tour.copy()
-        city = child[j]
-        child = np.delete(child, j)
-        child = np.insert(child, i, city)
-        return child"""
-
     def _mutate_invert(self, tour: np.ndarray) -> np.ndarray:
+        """ 
+            Pick two indices at random and invert the path from i to j
+            Return the resulting tour 
+        """
         i, j = self.rng.choice(tour.size, size=2, replace=False)
         if i > j:
             i, j = j, i
@@ -344,8 +351,8 @@ class r1072969:
 
     def _mutate_feasible(self, parent: np.ndarray, D: np.ndarray) -> np.ndarray:
         """
-        Try up to `feasible_retry` times to produce a mutated child with finite length.
-        If unsuccessful, return the parent (conservative fallback).
+            Try up to `feasible_retry` times to produce a mutated child with finite length
+            If unsuccessful, return the parent
         """
         ops = (self._mutate_swap, self._mutate_invert)
         for _ in range(self.feasible_retry):
@@ -360,12 +367,12 @@ class r1072969:
     # ==========================
     def _recombine_feasible(self, p1: np.ndarray, p2: np.ndarray, D: np.ndarray) -> np.ndarray:
         """
-        OX crossover with a light repair attempt: if infeasible, try a few random re-shuffles
-        around problematic edges; otherwise fall back to the fitter parent.
+            OX crossover with a light repair attempt: if infeasible, try a few random re-shuffles
+            around problematic edges; otherwise fall back to the fitter parent.
         """
         ops = (self._crossover_OX, self._crossover_ERX)
         op = self.rng.choice(ops)
-        child = op(p1, p2) # habrá que cambiar esto maybe para saber cuál coger
+        child = op(p1, p2)
         if np.isfinite(self._tour_length(child, D)):
             return child
 
@@ -390,62 +397,11 @@ class r1072969:
 
         # Fallback: return the better of the two parents
         return p1  # caller should pass parents in (best, other) order
-
-    """def _crossover_CX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
-        Cycle Crossover (CX): decomposes positions into cycles by mapping p2's values
-        back to their indices in p1. Alternates cycles between parents to produce
-        a valid permutation. Not guaranteed feasible in directed sense.
-
-        Args:
-            p1: Parent 1 as a permutation (np.ndarray of ints 0..n-1).
-            p2: Parent 2 as a permutation (np.ndarray of ints 0..n-1).
-
-        Returns:
-            child: A valid permutation (np.ndarray of dtype=int).
-        n = p1.size
-        child = -np.ones(n, dtype=int)
-
-        # Map each value in p1 -> its position index (requires values in 0..n-1)
-        pos_in_p1 = np.empty(n, dtype=int)
-        for i, v in enumerate(p1):
-            pos_in_p1[v] = i
-
-        visited = np.zeros(n, dtype=bool)
-        cycles = []
-
-        # --- Build cycles of positions ---
-        # Starting from each unvisited position, follow the chain:
-        # i -> p2[i] -> index in p1 where that value occurs -> repeat until we return.
-        for start in range(n):
-            if visited[start]:
-                continue
-            cycle = []
-            i = start
-            while not visited[i]:
-                visited[i] = True
-                cycle.append(i)
-                next_val = p2[i]
-                i = pos_in_p1[next_val]
-            cycles.append(np.array(cycle, dtype=int))
-
-        # Randomly decide which parent supplies the first cycle (to avoid bias)
-        start_with_p1 = bool(self.rng.choice(2))
-
-        use_p1 = start_with_p1
-        for cyc in cycles:
-            if use_p1:
-                child[cyc] = p1[cyc]
-            else:
-                child[cyc] = p2[cyc]
-            use_p1 = not use_p1  # alternate parent for next cycle
-
-        return child"""
-
     
     def _crossover_OX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
         """
-        Order Crossover (OX): preserves a slice from p1 and the relative order of the remaining
-        cities from p2. Produces a permutation (not guaranteed feasible in directed sense).
+            Order Crossover (OX): preserves a slice from p1 and the relative order of the remaining
+            cities from p2. Produces a permutation (not guaranteed feasible in directed sense).
         """
         n = p1.size
         a, b = sorted(self.rng.choice(n, size=2, replace=False))
@@ -467,24 +423,24 @@ class r1072969:
 
     def _crossover_ERX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
         """
-        Edge Recombination Crossover (ERX / Edge Crossover).
-        Constructs an adjacency (edge) table from both parents and builds a child by
-        repeatedly choosing the next city based on:
-        1) Preference for neighbors that are edges in BOTH parents (shared edges appear twice),
-        2) Otherwise choosing a neighbor whose current adjacency list is smallest,
-        3) Ties broken at random,
-        4) If no neighbors remain, pick a random unused city.
-        Args:
-            p1: Parent 1 as a permutation (np.ndarray of ints 0..n-1).
-            p2: Parent 2 as a permutation (np.ndarray of ints 0..n-1).
-        Returns:
-            child: A valid permutation (np.ndarray of dtype=int).
+            Edge Recombination Crossover (ERX / Edge Crossover).
+            Constructs an adjacency (edge) table from both parents and builds a child by
+            repeatedly choosing the next city based on:
+            1) Preference for neighbors that are edges in BOTH parents (shared edges appear twice),
+            2) Otherwise choosing a neighbor whose current adjacency list is smallest,
+            3) Ties broken at random,
+            4) If no neighbors remain, pick a random unused city.
+            Args:
+                p1: Parent 1 as a permutation (np.ndarray of ints 0..n-1).
+                p2: Parent 2 as a permutation (np.ndarray of ints 0..n-1).
+            Returns:
+                child: A valid permutation (np.ndarray of dtype=int).
         """
         n = p1.size
         child = -np.ones(n, dtype=int)
         used = np.zeros(n, dtype=bool)
 
-        # --- Build adjacency list with duplicates (shared edges appear twice) ---
+        # Build adjacency list with duplicates (shared edges appear twice) 
         # edges[c] is a list (not a set) to preserve duplicate neighbors
         edges: Dict[int, List[int]] = {int(c): [] for c in p1}
 
@@ -498,7 +454,7 @@ class r1072969:
         add_parent_edges(p1)
         add_parent_edges(p2)
 
-        # --- Helper: remove a city from all adjacency lists (so it can't be chosen again) ---
+        # Helper: remove a city from all adjacency lists (so it can't be chosen again)
         def remove_city_from_all(x: int) -> None:
             for k in edges.keys():
                 lst = edges[k]
@@ -506,14 +462,14 @@ class r1072969:
                     # remove all occurrences of x (handles duplicates cleanly)
                     edges[k] = [u for u in lst if u != x]
 
-        # --- Choose a starting city: randomly between the two parents' first cities ---
+        # Choose a starting city: randomly between the two parents' first cities 
         start_candidates = np.array([int(p1[0]), int(p2[0])], dtype=int)
         current = int(self.rng.choice(start_candidates))
         child[0] = current
         used[current] = True
         remove_city_from_all(current)
 
-        # --- Build the rest of the tour ---
+        # Build the rest of the tour 
         for pos in range(1, n):
             neigh = edges[current]  # neighbors list (may contain duplicates)
             # Normally, used nodes have already been removed from all lists
@@ -542,100 +498,13 @@ class r1072969:
 
         return child
 
-    """def _crossover_PMX(self,parent1: Sequence[Hashable],parent2: Sequence[Hashable],cut_points: Optional[Tuple[int, int]] = None,) -> Tuple[List[Hashable], List[Hashable]]:
-        
-        Perform PMX (Partially Mapped Crossover) on two permutation parents.
-        Args:
-            parent1: First parent (permutation of unique, hashable genes).
-            parent2: Second parent (same genes in some order).
-            cut_points: Optional (c1, c2). If None, chosen randomly.
-                        Inclusive indices: 0 <= c1 < c2 < n
-        Returns:
-            (child1, child2): Two offspring lists.
-        Raises:
-            ValueError: If parents have different lengths, are not permutations,
-                        or cut_points are invalid.
-        
-        n = len(parent1)
-        if len(parent2) != n:
-            raise ValueError("Parents must have the same length.")
-        if n < 2:
-            # Not enough length to crossover—return copies
-            return list(parent1), list(parent2)
-
-        # Validate permutations and gene sets
-        if len(set(parent1)) != n or len(set(parent2)) != n:
-            raise ValueError("PMX requires parents to be permutations (all genes unique).")
-        if set(parent1) != set(parent2):
-            raise ValueError("Parents must contain the exact same set of genes.")
-
-        # Choose/validate crossover points
-        if cut_points is None:            
-            c1, c2 = np.sort(self.rng.choice(n, size=2, replace=False))
-        else:
-            c1, c2 = cut_points
-            if not (0 <= c1 < c2 < n):
-                raise ValueError("cut_points must satisfy 0 <= c1 < c2 < n.")
-
-        return self._pmx_pair(parent1, parent2, c1, c2)
-
-    def _pmx_pair(self, p1: Sequence[Hashable], p2: Sequence[Hashable], c1: int, c2: int) -> Tuple[List[Hashable], List[Hashable]]:
-        
-        Build both PMX offspring using inclusive indices [c1..c2].
-        Assumes p1 and p2 are permutations (no duplicates).
-        
-        n = len(p1)
-        assert len(p2) == n and 0 <= c1 <= c2 < n
-
-        # Optional: normalize NumPy integer types to Python ints to avoid mixed-type surprises
-        def _normalize(seq):
-            return [int(x) if isinstance(x, np.integer) else x for x in seq]
-
-        p1 = _normalize(p1)
-        p2 = _normalize(p2)
-
-        child1 = [None] * n
-        child2 = [None] * n
-
-        # 1) Copy the crossover segments directly (inclusive c1..c2)
-        child1[c1 : c2 + 1] = p1[c1 : c2 + 1]
-        child2[c1 : c2 + 1] = p2[c1 : c2 + 1]
-
-        # 2) Build mapping dictionaries for conflict resolution chains
-        # For child1: conflicts are against p1's segment => use p1 -> p2 mapping
-        map_p1_to_p2 = {p1[i]: p2[i] for i in range(c1, c2 + 1)}
-        # For child2: conflicts are against p2's segment => use p2 -> p1 mapping
-        map_p2_to_p1 = {p2[i]: p1[i] for i in range(c1, c2 + 1)}
-
-        seg1 = set(child1[c1 : c2 + 1])  # values copied from p1
-        seg2 = set(child2[c1 : c2 + 1])  # values copied from p2
-
-        # 3) Fill positions outside the segment
-        for i in range(n):
-            if c1 <= i <= c2:
-                continue
-
-            # Fill child1 from p2, resolving conflicts via p1->p2 mapping chains
-            g = p2[i]
-            while g in seg1:
-                g = map_p1_to_p2[g]
-            child1[i] = g
-
-            # Fill child2 from p1, resolving conflicts via p2->p1 mapping chains
-            g = p1[i]
-            while g in seg2:
-                g = map_p2_to_p1[g]
-            child2[i] = g
-
-        return child1, child2"""
-
-    
     # ===========================
     # ---- Selection helpers ----
     # ===========================
-    
     def _tournament_select_idx(self, fitness: np.ndarray, k: int) -> int:
-        """Return index of the tournament winner (lowest fitness)."""
+        """
+            Return index of the tournament winner (lowest fitness)
+        """
         n = fitness.size
         cand = self.rng.integers(0, n, size=k)
         winner = cand[np.argmin(fitness[cand])]
@@ -643,8 +512,10 @@ class r1072969:
     
     @staticmethod
     def _compute_fitness_population(population: list[np.ndarray], D: np.ndarray) -> np.ndarray:
-        """ Compute objective function for each tour 
-            Returns an array of fitnesses """
+        """ 
+            Compute objective function for each tour 
+            Returns an array of fitnesses 
+        """
         return np.array([r1072969._tour_length(t, D) for t in population], dtype=float)
     
     # ===========================
@@ -652,6 +523,9 @@ class r1072969:
     # ===========================
     @staticmethod
     def _diversity_plot_unique_edges(diversity_counts) -> None:
+        """
+            Plot and save image of the number of unique directed edges in the population over generations.
+        """
         if len(diversity_counts) > 0:
             fig, ax = plt.subplots(figsize=(9, 4.5))
             x = np.arange(1, len(diversity_counts) + 1)
@@ -667,10 +541,11 @@ class r1072969:
     # ===========================
     # ---- Utility functions ----
     # ===========================
-    
     @staticmethod
     def _unique_by_tuple(pop: list[np.ndarray]) -> list[np.ndarray]:
-        """Remove exact duplicates (tuple hashing). Preserves order."""
+        """
+            Remove exact duplicates (tuple hashing). Preserves order.
+        """
         seen = set()
         uniq = []
         for t in pop:
@@ -683,8 +558,7 @@ class r1072969:
     @staticmethod
     def _tour_length(tour: np.ndarray, D: np.ndarray) -> float:
         """
-        Compute directed cycle length. Returns np.inf if any edge is infeasible (∞).
-        tour: 1D array of unique city indices, cover all cities exactly once.
+            Compute directed cycle length. Returns np.inf if any edge is infeasible (∞).
         """
         idx = tour
         nxt = np.roll(idx, -1)
@@ -697,8 +571,7 @@ class r1072969:
     @staticmethod
     def _finite_outgoing_mask(D: np.ndarray) -> np.ndarray:
         """
-        Boolean mask M where M[i, j] is True iff edge i->j is finite and j != i.
-        Used to speed up feasible construction/repair.
+            Boolean mask M where M[i, j] is True iff edge i->j is finite and j != i.
         """
         M = np.isfinite(D)
         np.fill_diagonal(M, False)
@@ -707,14 +580,14 @@ class r1072969:
     @staticmethod
     def _count_unique_edges_in_population(pop: list[np.ndarray], Dmat: np.ndarray) -> int:
         """
-        Count the number of unique finite directed edges i->j present across the population.
-        Directed matters (i->j is different from j->i).
+            Count the number of unique finite directed edges i->j present across the population.
+            Directed matters (i->j is different from j->i).
         """
         uniq: set[tuple[int, int]] = set()
         for t in pop:
             idx = t
             nxt = np.roll(idx, -1)  # last -> first closes the cycle
-            # Only count edges with finite cost (feasible directed arcs)
+            # Only count edges with finite cost
             finite_mask = np.isfinite(Dmat[idx, nxt])
             # Add directed pairs for finite edges only
             for i, j, f in zip(idx, nxt, finite_mask):
@@ -731,9 +604,9 @@ if __name__ == '__main__':
 
     #start_time = time.perf_counter()
 
-    a = r1072969(mu=200, lamb=270, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
+    a = r1072969(mu=100, lamb=100, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
 
-    a.optimize("./tour250.csv")
+    a.optimize("./tour1000.csv")
     
     #end_time = time.perf_counter()
 
