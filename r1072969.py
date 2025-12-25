@@ -21,14 +21,9 @@ class r1072969:
                  crossover_rate: float = 0.9,      # probability to recombine two parents ¿?
                  feasible_retry: int = 20          # retries to obtain a feasible variation
                  ):
-        """
-        ¿Parameters are modest defaults aimed at n in [100..1000] with ~5 min CPU budget.
-        You can tune these later (e.g., for your experiments in session 3).?
-        """
         self.reporter = Reporter.Reporter(self.__class__.__name__)
         self.rng = np.random.default_rng(rng_seed)
 
-        # Hyperparameters (may be auto-set after reading instance size)
         self.mu = mu
         self.lamb = lamb
         self.k_tournament = k_tournament
@@ -42,11 +37,7 @@ class r1072969:
         n = D.shape[0]
         M = self._finite_outgoing_mask(D)
 
-        # Carol: ¿esto es realmente necesario lo de auto?
-        # Auto-parameterization (safe defaults for 100..1000)
         mu = self.mu
-        lamb = self.lamb
-        k = self.k_tournament
 
         # ---- Initialize a feasible population ----
         # Carol: vamos a probar a aplicar el smart initialisation solo a una parte de la población inicial, y lo otro completamente aleatorio pero feasible. Luego puedes probar con completamente aleatorio instead.
@@ -55,14 +46,13 @@ class r1072969:
 
         # Compute counts
         num_greedy = max(1, int(round(0.20 * mu)))        # ensure at least 1 greedy
-        num_random = mu - num_greedy
     
         greedy_tries, random_tries = 0, 0
         max_total_tries = 10_000
-        #### INITIALISATION ####
+        
         # First: inject high-quality greedy tours (~20%)
         while len(population) < num_greedy and (greedy_tries + random_tries) < max_total_tries:
-            greedy_tries += 1 # MIRA BIEN A VER QUÉ ES ESTO DE LOS TRIES 
+            greedy_tries += 1 
             try:
                 tour = self._randomized_greedy_initialisation_feasible(D, M)
                 population.append(tour)
@@ -88,8 +78,7 @@ class r1072969:
         return population
             
     # ---- Selection ----
-    # pon los metodos nuevos tuyos aquí  y en el main loop apenas será llamar a estos, y argupa aquí todo en cada uno
-    def selection(self, population: np.ndarray, fitness: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def selection(self, population: list[np.ndarray], fitness: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         k = self.k_tournament
         mu = self.mu
         # Parent selection (k-tournament)
@@ -102,12 +91,46 @@ class r1072969:
         # Ensure p1 is the better parent (helps in fallback decisions)
         if fitness[p2_idx] < fitness[p1_idx]:
             p1, p2 = p2, p1
+        return p1, p2
     
     # ---- Crossover ----
+    def crossover(self, p1: np.ndarray, p2: np.ndarray, D: np.ndarray) -> np.ndarray:
+        if self.rng.random() < self.crossover_rate:
+            child = self._recombine_feasible(p1, p2, D)
+        else:
+            child = p1.copy()
+
+        return child
 
     # ---- Mutation ----
+    def mutation(self, child: np.ndarray, D: np.ndarray) -> np.ndarray:
+        # Mutation with probability
+        if self.rng.random() < self.mutation_rate:
+            child = self._mutate_feasible(child, D)
+        return child
     
     # ---- Elimination ----
+    def elimination(self, joined_population: list[np.ndarray], joined_fitnesses: np.ndarray, distanceMatrix: np.ndarray) -> Tuple:
+        """ (μ+λ) Elitist survival with duplicate filtering """
+        mu = self.mu
+        D = distanceMatrix
+        # Sort by fitness (ascending), keep feasible first (np.inf automatically sinks to end)
+        order = np.argsort(joined_fitnesses, kind='mergesort')
+        sorted_pop = [joined_population[i] for i in order]
+        sorted_fit = joined_fitnesses[order]
+
+        # Remove duplicates to preserve some diversity
+        sorted_pop = self._unique_by_tuple(sorted_pop)
+        # Recompute fitness for the filtered ordering
+        # (We can align by recomputing for safety; but reuse the sorted order's fitness where possible)
+        # Simpler: recompute
+        sorted_fit = self._compute_fitness_population(sorted_pop, D)
+
+        # Keep top μ
+        population = sorted_pop[:mu]
+        population_fitnesses = sorted_fit[:mu]
+        
+        return population, population_fitnesses
 
 
     # ==========================
@@ -125,16 +148,14 @@ class r1072969:
         # --- Initialisation ---
         population = self.initialisation(D)
 
-        fitness = self._evaluate_population(population, D)
-        best_idx = int(np.argmin(fitness))
+        population_fitnesses = self._compute_fitness_population(population, D)
+        best_idx = int(np.argmin(population_fitnesses))
         best_tour = population[best_idx].copy()
-        best_fit = float(fitness[best_idx])
+        best_fit = float(population_fitnesses[best_idx])
         
         diversity_counts: list[int] = []
         
-        mu = self.mu
         lamb = self.lamb
-        k = self.k_tournament
 
         # ===== Evolutionary loop =====
         yourConvergenceTestsHere = True
@@ -145,46 +166,29 @@ class r1072969:
             # Recombination + Mutation to produce λ children
             while len(offspring) < lamb:
                 # --- Selection --- (k-tournament)
-                p1, p2 = self.selection(population, fitness)
+                p1, p2 = self.selection(population, population_fitnesses)
+                
+                # --- Crossover ---
+                child = self.crossover(p1, p2, D)
 
-                # Crossover with probability
-                if self.rng.random() < self.crossover_rate:
-                    child = self._recombine_feasible(p1, p2, D)
-                else:
-                    child = p1.copy()
-
-                # Mutation with probability
-                if self.rng.random() < self.mutation_rate:
-                    child = self._mutate_feasible(child, D)
+                # --- Mutation ---
+                child = self.mutation(child, D)
 
                 offspring.append(child)
 
-            # ---------- Evaluate offspring ----------
-            off_fit = self._evaluate_population(offspring, D)
+            # evaluate fitness of the offsprings 
+            offspring_fitnesses = self._compute_fitness_population(offspring, D)
+            joined_fitnesses = np.concatenate((population_fitnesses, offspring_fitnesses))
 
-            # ---------- (μ+λ) Elitist survival with duplicate filtering ----------
-            combined = population + offspring
-            combined_fit = np.concatenate((fitness, off_fit))
+            # joining offspring with previous population
+            joined_population = population + offspring
 
-            # Sort by fitness (ascending), keep feasible first (np.inf automatically sinks to end)
-            order = np.argsort(combined_fit, kind='mergesort')
-            sorted_pop = [combined[i] for i in order]
-            sorted_fit = combined_fit[order]
-
-            # Remove duplicates to preserve some diversity
-            sorted_pop = self._unique_by_tuple(sorted_pop)
-            # Recompute fitness for the filtered ordering
-            # (We can align by recomputing for safety; but reuse the sorted order's fitness where possible)
-            # Simpler: recompute
-            sorted_fit = self._evaluate_population(sorted_pop, D)
-
-            # Keep top μ
-            population = sorted_pop[:mu]
-            fitness = sorted_fit[:mu]
+            # ---------- Elimination ----------
+            population, population_fitnesses = self.elimination(joined_population, joined_fitnesses, D)
 
             # ---------- Track best ----------
-            gen_best_idx = int(np.argmin(fitness))
-            gen_best_fit = float(fitness[gen_best_idx])
+            gen_best_idx = int(np.argmin(population_fitnesses))
+            gen_best_fit = float(population_fitnesses[gen_best_idx])
             if gen_best_fit < best_fit:
                 best_fit = gen_best_fit
                 best_tour = population[gen_best_idx].copy()
@@ -192,41 +196,24 @@ class r1072969:
             # ---------- Reporting ----------
             # Mean objective: use numeric mean, with infeasible counted as +∞; for CSV readability,
             # convert to float (will print 'inf' if infeasible tours remain).
-            meanObjective = float(np.mean(fitness))
+            meanObjective = float(np.mean(population_fitnesses))
             bestObjective = float(best_fit)
             bestSolution = best_tour.astype(int)
             
-            #----
             # ---------- Diversity (unique directed edges) ----------
             diversity_counts.append(self._count_unique_edges_in_population(population, D))
-            #----
 
             # Leave the next three lines as they are (per assignment)
             timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
             if timeLeft < 0:
                 break
-
-        #-------
         
-        # ---------- Diversity plot ----------
-        if len(diversity_counts) > 0:
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            x = np.arange(1, len(diversity_counts) + 1)
-            ax.plot(x, diversity_counts, lw=2, color='tab:blue')
-            ax.set_xlabel("Generation")
-            ax.set_ylabel("Unique directed edges in population")
-            ax.set_title("Population diversity (unique edges) over generations")
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig("diversity_evolution.png", dpi=150, bbox_inches='tight')
-            plt.close(fig)
+        # Plot and save diversity evolution
+        self._diversity_plot_unique_edges(diversity_counts)
 
-        #-------
         return 0
     
-    # ==========================
-    # ---- Initialisation helpers -----
-    # ==========================
+    #  Initialisation helpers 
     def _randomized_greedy_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 200) -> np.ndarray:
         """
         1. Precompute nearest neighbors for every city among feasible targets, sorted by distance for speed.
@@ -659,10 +646,27 @@ class r1072969:
         return int(winner)
     
     @staticmethod
-    def _evaluate_population(pop: list[np.ndarray], D: np.ndarray) -> np.ndarray:
+    def _compute_fitness_population(pop: list[np.ndarray], D: np.ndarray) -> np.ndarray:
         """Vector-ish evaluation for a list of tours -> array of fitnesses (lower is better)."""
         # Keep it simple; loop is fine because evaluate is O(n) anyway.
         return np.array([r1072969._tour_length(t, D) for t in pop], dtype=float)
+    
+    # ===========================
+    # ---- Diversity helpers ----
+    # ===========================
+    @staticmethod
+    def _diversity_plot_unique_edges(diversity_counts) -> None:
+        if len(diversity_counts) > 0:
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            x = np.arange(1, len(diversity_counts) + 1)
+            ax.plot(x, diversity_counts, lw=2, color='tab:blue')
+            ax.set_xlabel("Generation")
+            ax.set_ylabel("Unique directed edges in population")
+            ax.set_title("Population diversity (unique edges) over generations")
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig("diversity_evolution.png", dpi=150, bbox_inches='tight')
+            plt.close(fig)
     
     # ===========================
     # ---- Utility functions ----
@@ -733,7 +737,7 @@ if __name__ == '__main__':
 
     a = r1072969(mu=200, lamb=270, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
 
-    a.optimize("./tour50.csv")
+    a.optimize("./tour250.csv")
     
     #end_time = time.perf_counter()
 
