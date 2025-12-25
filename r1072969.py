@@ -165,9 +165,8 @@ class r1072969:
             # ---------- Create offspring ----------
             offspring: list[np.ndarray] = []
 
-            # Recombination + Mutation to produce λ children
             while len(offspring) < lamb:
-                # --- Selection --- (k-tournament)
+                # --- Selection --- 
                 p1, p2 = self.selection(population, population_fitnesses)
                 
                 # --- Crossover ---
@@ -177,7 +176,6 @@ class r1072969:
                 child = self.mutation(child, D)
 
                 offspring.append(child)
-
             # evaluate fitness of the offsprings 
             offspring_fitnesses = self._compute_fitness_population(offspring, D)
             joined_fitnesses = np.concatenate((population_fitnesses, offspring_fitnesses))
@@ -439,30 +437,24 @@ class r1072969:
         n = p1.size
         child = -np.ones(n, dtype=int)
         used = np.zeros(n, dtype=bool)
-
-        # Build adjacency list with duplicates (shared edges appear twice) 
-        # edges[c] is a list (not a set) to preserve duplicate neighbors
-        edges: Dict[int, List[int]] = {int(c): [] for c in p1}
-
-        def add_parent_edges(parent: np.ndarray):
+        
+        # Build successor-only adjacency (duplicate if shared)
+        succ_edges: Dict[int, List[int]] = {int(c): [] for c in p1}
+        def add_parent_successors(parent: np.ndarray):
             for i, c in enumerate(parent):
                 c = int(c)
-                left = int(parent[(i - 1) % n])
-                right = int(parent[(i + 1) % n])
-                edges[c].extend([left, right])
+                right = int(parent[(i + 1) % n])   # successor only
+                succ_edges[c].append(right)
 
-        add_parent_edges(p1)
-        add_parent_edges(p2)
+        add_parent_successors(p1)
+        add_parent_successors(p2)
 
         # Helper: remove a city from all adjacency lists (so it can't be chosen again)
         def remove_city_from_all(x: int) -> None:
-            for k in edges.keys():
-                lst = edges[k]
-                if lst:
-                    # remove all occurrences of x (handles duplicates cleanly)
-                    edges[k] = [u for u in lst if u != x]
+            for k in succ_edges.keys():
+                succ_edges[k] = [u for u in succ_edges[k] if u != x]
 
-        # Choose a starting city: randomly between the two parents' first cities 
+        # Start from one of the parents' first cities
         start_candidates = np.array([int(p1[0]), int(p2[0])], dtype=int)
         current = int(self.rng.choice(start_candidates))
         child[0] = current
@@ -471,18 +463,17 @@ class r1072969:
 
         # Build the rest of the tour 
         for pos in range(1, n):
-            neigh = edges[current]  # neighbors list (may contain duplicates)
+            neigh = succ_edges[current]  # neighbors list (may contain duplicates)
             # Normally, used nodes have already been removed from all lists
-            candidates = neigh  # still keep as list for frequency/dup detection
 
-            if len(candidates) > 0:
+            if len(neigh) > 0:
                 # Prefer neighbors that appear in BOTH parents (duplicates in 'neigh')
                 cnt = Counter(neigh)
-                shared = [v for v in cnt if cnt[v] > 1]
+                shared = [v for v in cnt if cnt[v] > 1] # shared successors get priority
 
-                pool = shared if shared else list(set(candidates))  # ensure uniqueness beyond duplicates
+                pool = shared if shared else list(set(neigh))
                 # Choose those with the smallest current adjacency size
-                sizes = [len(edges[v]) for v in pool]
+                sizes = [len(succ_edges[v]) for v in pool]
                 min_size = min(sizes)
                 best = [v for v, s in zip(pool, sizes) if s == min_size]
                 next_city = int(self.rng.choice(np.array(best, dtype=int)))
