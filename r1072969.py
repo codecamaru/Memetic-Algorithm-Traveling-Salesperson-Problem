@@ -203,7 +203,9 @@ class r1072969:
 
         return 0
     
-    #  Initialisation helpers 
+    # ==========================
+    # Initialisation helpers   
+    # ==========================
     def _randomised_greedy_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 200) -> np.ndarray:
         """
             1. Precompute nearest neighbors for every city among feasible targets, sorted by distance for speed.
@@ -314,9 +316,8 @@ class r1072969:
         raise ValueError("Failed to construct a random feasible tour.")
     
     # ==========================
-    # ---- Mutation operators   -----
+    #  Mutation operators   
     # ==========================
-
     def _mutate_swap(self, tour: np.ndarray) -> np.ndarray:
         i, j = self.rng.choice(tour.size, size=2, replace=False)
         child = tour.copy()
@@ -355,15 +356,16 @@ class r1072969:
         return parent
     
     # ==========================
-    # ---- Crossover operators   -----
+    #  Crossover operators   
     # ==========================
-
     def _recombine_feasible(self, p1: np.ndarray, p2: np.ndarray, D: np.ndarray) -> np.ndarray:
         """
         OX crossover with a light repair attempt: if infeasible, try a few random re-shuffles
         around problematic edges; otherwise fall back to the fitter parent.
         """
-        child = self._crossover_OX(p1, p2) # habrá que cambiar esto maybe para saber cuál coger
+        ops = (self._crossover_OX, self._crossover_CX, self._crossover_ERX, self._crossover_PMX)
+        op = self.rng.choice(ops)
+        child = op(p1, p2) # habrá que cambiar esto maybe para saber cuál coger
         if np.isfinite(self._tour_length(child, D)):
             return child
 
