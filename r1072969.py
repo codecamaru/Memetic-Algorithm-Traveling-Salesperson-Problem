@@ -36,42 +36,34 @@ class r1072969:
         D = distanceMatrix
         n = D.shape[0]
         M = self._finite_outgoing_mask(D)
-
         mu = self.mu
-
-        # ---- Initialize a feasible population ----
-        # Carol: vamos a probar a aplicar el smart initialisation solo a una parte de la población inicial, y lo otro completamente aleatorio pero feasible. Luego puedes probar con completamente aleatorio instead.
-        
+   
         population: list[np.ndarray] = []
 
-        # Compute counts
-        num_greedy = max(1, int(round(0.20 * mu)))        # ensure at least 1 greedy
+        num_greedy_individuals = max(1, int(round(0.20 * mu))) # ensure at least 1 greedy
     
         greedy_tries, random_tries = 0, 0
         max_total_tries = 10_000
         
-        # First: inject high-quality greedy tours (~20%)
-        while len(population) < num_greedy and (greedy_tries + random_tries) < max_total_tries:
+        # greedy tours (~20% population)
+        while len(population) < num_greedy_individuals and (greedy_tries + random_tries) < max_total_tries:
             greedy_tries += 1 
             try:
-                tour = self._randomized_greedy_initialisation_feasible(D, M)
+                tour = self._randomised_greedy_initialisation_feasible(D, M)
                 population.append(tour)
             except ValueError:
-                # Highly constrained instance; keep trying
                 continue
 
-        # Second: fill remaining with random feasible (~80%)
+        # random tours (~80% population)
         while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
             random_tries += 1
             try:
-                tour = self._random_initialisation_feasible(D, M)
+                tour = self._randomised_initialisation_feasible(D, M)
                 population.append(tour)
             except ValueError:
-                # If random feasible fails, keep trying; may be highly constrained
                 continue
 
-        # Fallback: as a last resort, fill the rest with pure random permutations (may be infeasible)
-        # EA will attempt to repair via variation; this should rarely happen.
+        # in case of ValueError raised, fill the rest with pure random and potentially infeasible permutations
         while len(population) < mu:
             population.append(self.rng.permutation(n))
         
@@ -194,8 +186,6 @@ class r1072969:
                 best_tour = population[gen_best_idx].copy()
 
             # ---------- Reporting ----------
-            # Mean objective: use numeric mean, with infeasible counted as +∞; for CSV readability,
-            # convert to float (will print 'inf' if infeasible tours remain).
             meanObjective = float(np.mean(population_fitnesses))
             bestObjective = float(best_fit)
             bestSolution = best_tour.astype(int)
@@ -214,24 +204,17 @@ class r1072969:
         return 0
     
     #  Initialisation helpers 
-    def _randomized_greedy_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 200) -> np.ndarray:
+    def _randomised_greedy_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 200) -> np.ndarray:
         """
-        1. Precompute nearest neighbors for every city among feasible targets, sorted by distance for speed.
-        2.Try up to max_restarts; in each attempt:
-            Pick a random start city.
-            Build the tour greedily: at each step, choose among the nearest feasible unvisited neighbors, but add a bit of randomness by sampling among the top-k (with k ≤ 5) to improve diversity and avoid traps.
-            If the greedy sequence finishes, ensure the cycle closes (last → first is finite). If not, try a simple swap fix near the end.
-        3. If all restarts fail, raise an error.
-        
-        Construct a *feasible* tour using a randomized greedy heuristic:
-        - pick a random start,
-        - repeatedly choose the nearest feasible next city with a small randomization (biased choice),
-        - if stuck, restart.
-        Returns a permutation that induces only finite edges (including last->first), or raises ValueError.
+            1. Precompute nearest neighbors for every city among feasible targets, sorted by distance for speed.
+            2. Try up to max_restarts; in each attempt:
+                Pick a random start city.
+                Build the tour greedily: at each step, choose among the nearest feasible unvisited neighbors, but add a bit of randomness by sampling among the top-k (with k ≤ 5) 
+                If the greedy sequence finishes, ensure the cycle closes (last → first is finite). If not, try a simple swap fix near the end.
+            3. If all restarts fail, raise an error.
         """
+        # feasible neighbors lists sorted by distance 
         n = D.shape[0]
-        # Precompute neighbor lists sorted by distance for speed.
-        # neighbors[i] = array of target cities j (j!=i) with finite D[i,j], sorted by D[i,j]
         neighbors = []
         for i in range(n):
             js = np.where(M[i])[0]
@@ -256,7 +239,7 @@ class r1072969:
                 if cand.size == 0:
                     feasible = False
                     break
-                # Biased randomized choice among up to top 5 nearest to promote diversity
+                # randomized choice among up to top 5 nearest to promote diversity
                 k = min(5, cand.size)
                 next_city = self.rng.choice(cand[:k])
                 tour[pos] = next_city
@@ -277,14 +260,14 @@ class r1072969:
             # else restart
         raise ValueError("Failed to construct a feasible tour with randomized-greedy.")
     
-    def _random_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 500) -> np.ndarray:
+    def _randomised_initialisation_feasible(self, D: np.ndarray, M: np.ndarray, max_restarts: int = 500) -> np.ndarray:
         """
-        Construct a feasible tour using a random walk constrained by feasibility (M):
-        - pick a random start,
-        - repeatedly choose a random feasible unvisited next city (uniform choice),
-        - if stuck, restart,
-        - ensure last->first is finite; try a simple end-fix via swapping if needed.
-        Returns a permutation that induces only finite edges (including last->first), or raises ValueError.
+            Construct a feasible tour using a random walk constrained by feasibility (M):
+                - pick a random start,
+                - repeatedly choose a random feasible unvisited next city (uniform choice),
+                - if stuck, restart,
+                - ensure last->first is finite; try a simple end-fix via swapping if needed.
+            Returns a permutation that induces only finite edges (including last->first), or raises ValueError.
         """
         n = D.shape[0]
 
@@ -340,7 +323,7 @@ class r1072969:
         child[i], child[j] = child[j], child[i]
         return child
 
-    def _mutate_insert(self, tour: np.ndarray) -> np.ndarray:
+    """def _mutate_insert(self, tour: np.ndarray) -> np.ndarray:
         i, j = self.rng.choice(tour.size, size=2, replace=False)
         if i > j:
             i, j = j, i
@@ -348,7 +331,7 @@ class r1072969:
         city = child[j]
         child = np.delete(child, j)
         child = np.insert(child, i, city)
-        return child
+        return child"""
 
     def _mutate_invert(self, tour: np.ndarray) -> np.ndarray:
         i, j = self.rng.choice(tour.size, size=2, replace=False)
@@ -363,7 +346,7 @@ class r1072969:
         Try up to `feasible_retry` times to produce a mutated child with finite length.
         If unsuccessful, return the parent (conservative fallback).
         """
-        ops = (self._mutate_swap, self._mutate_insert, self._mutate_invert)
+        ops = (self._mutate_swap, self._mutate_invert)
         for _ in range(self.feasible_retry):
             op = self.rng.choice(ops)
             child = op(parent)
