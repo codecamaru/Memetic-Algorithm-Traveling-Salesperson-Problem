@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from typing import Tuple, List, Dict
 from collections import Counter
 import random
+import time
 
 #import psutil
 #import os
@@ -34,34 +35,33 @@ class r1072969:
     # ---- Initialisation ----
     def initialisation(self, distanceMatrix: np.ndarray) -> np.ndarray:
         """ 
-            Generate mu individuals (20% greedy, 80% random), all feasible if possible 
+            Generate mu individuals (40% greedy, 60% random), all feasible if possible 
         """
-        D = distanceMatrix
-        n = D.shape[0]
-        M = self._finite_outgoing_mask(D)
+        n = distanceMatrix.shape[0]
+        M = self._finite_outgoing_mask(distanceMatrix)
         mu = self.mu
    
         population: list[np.ndarray] = []
 
-        num_greedy_individuals = max(1, int(round(0.20 * mu))) # ensure at least 1 greedy
+        num_greedy_individuals = max(1, int(round(0.99 * mu))) # ensure at least 1 greedy
     
         greedy_tries, random_tries = 0, 0
         max_total_tries = 10_000
         
-        # greedy tours (~20% population)
+        # greedy tours (~40% population)
         while len(population) < num_greedy_individuals and (greedy_tries + random_tries) < max_total_tries:
             greedy_tries += 1 
             try:
-                tour = self._randomised_greedy_initialisation_feasible(D, M)
+                tour = self._randomised_greedy_initialisation_feasible(distanceMatrix, M)
                 population.append(tour)
             except ValueError:
                 continue
 
-        # random tours (~80% population)
+        # random tours (~60% population)
         while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
             random_tries += 1
             try:
-                tour = self._randomised_initialisation_feasible(D, M)
+                tour = self._randomised_initialisation_feasible(distanceMatrix, M)
                 population.append(tour)
             except ValueError:
                 continue
@@ -92,25 +92,132 @@ class r1072969:
         return p1, p2
     
     # ---- Crossover ----
-    def crossover(self, p1: np.ndarray, p2: np.ndarray, D: np.ndarray) -> np.ndarray:
+    def crossover(self, p1: np.ndarray, p2: np.ndarray, distanceMatrix: np.ndarray) -> np.ndarray:
         """ 
             Generate crossover_rate*lambda offsprings, the rest are copies of one parent
         """
         if self.rng.random() < self.crossover_rate:
-            child = self._recombine_feasible(p1, p2, D)
+            child = self._recombine_feasible(p1, p2, distanceMatrix)
         else:
             child = p1.copy()
 
         return child
 
     # ---- Mutation ----
-    def mutation(self, child: np.ndarray, D: np.ndarray) -> np.ndarray:
+    def mutation(self, child: np.ndarray, distanceMatrix: np.ndarray) -> np.ndarray:
         """ 
             Mutate mutation_rate*lambda of the children 
         """
         if self.rng.random() < self.mutation_rate:
-            child = self._mutate_feasible(child, D)
+            child = self._mutate_feasible(child, distanceMatrix)
         return child
+    
+    # --- Local Search Operator ---
+    def local_search(self, offspring: list[np.ndarray], distanceMatrix: np.ndarray) -> list[np.ndarray]:
+        """ 
+            2-Opt local search on offspring (directed TSP, supports ∞ entries).
+            First-improvement: for each child, repeatedly apply any improving 2-opt reversal
+            until no improvement is found. Returns the improved offspring list.
+        """
+        improved_offspring: list[np.ndarray] = []
+
+        # --- Budget ---
+        p_ls = 0.8               # apply LS only to ~35% of children (set to 1.0 for all)
+        max_evals = 4000          # max (i,k) evaluations per child
+        max_moves = 120           # max improving reversals applied per child
+        time_cap_ms = 10          # per-child time cap in milliseconds
+        EPS = 1e-12
+
+        def atsp_two_opt_delta_and_feasible(tour: np.ndarray, i: int, k: int) -> tuple[float, bool]:
+            """
+            Compute the change in tour length if we reverse segment (i+1 .. k),
+            and check that all new arcs are finite. Works for directed/asymmetric matrices.
+
+            Returns (delta, feasible_new_tour).
+            """
+            n = tour.size
+            # adjacency including wrap: reversing a length-1 segment or (0, n-1) is a no-op
+            if (i + 1) % n == k or (k + 1) % n == i:
+                return 0.0, False
+
+            a = tour[i]
+            b = tour[(i + 1) % n]
+            c = tour[k]
+            d = tour[(k + 1) % n]
+
+            # New endpoint arcs must be finite: a->c and b->d
+            if not (np.isfinite(distanceMatrix[a, c]) and np.isfinite(distanceMatrix[b, d])):
+                return 0.0, False
+
+            # Start with endpoint changes
+            delta = -distanceMatrix[a, b] - distanceMatrix[c, d] + distanceMatrix[a, c] + distanceMatrix[b, d]
+
+            # Internal arcs reverse direction: (v_t -> v_{t+1}) becomes (v_{t+1} -> v_t)
+            # Check finiteness and accumulate delta for each flipped arc
+            # Segment (i+1 .. k) includes arcs (t, t+1) for t in [i+1 .. k-1]
+            for t in range(i + 1, k):
+                u = tour[t]
+                v = tour[t + 1]
+                # New arc will be v->u; must be finite
+                if not np.isfinite(distanceMatrix[v, u]):
+                    return 0.0, False
+                delta += (distanceMatrix[v, u] - distanceMatrix[u, v])
+
+            return float(delta), True
+
+        def apply_two_opt_inplace(tour: np.ndarray, i: int, k: int) -> None:
+            """Reverse the segment (i+1 .. k) in place; assumes i < k."""
+            if i > k:
+                i, k = k, i
+            tour[i + 1 : k + 1] = tour[i + 1 : k + 1][::-1]
+
+        for child in offspring:
+            # Probabilistic LS to control runtime
+            if self.rng.random() >= p_ls:
+                improved_offspring.append(child)
+                continue
+
+            t = child.copy()
+            # Skip clearly infeasible tours
+            if not np.isfinite(self._tour_length(t, distanceMatrix)):
+                improved_offspring.append(t)
+                continue
+
+            n = t.size
+            start = time.perf_counter()
+            evals = 0
+            moves = 0
+            
+            improved = True
+            while improved:
+                improved = False
+                # First-improvement sweep with budgets
+                for i in range(n):
+                    for k in range(i + 2, n):
+                        if i == 0 and k == n - 1:
+                            continue  # wrap-adjacent
+                        # Budget checks (cheap and frequent)
+                        if evals >= max_evals or moves >= max_moves:
+                            break
+                        if (time.perf_counter() - start) * 1000.0 >= time_cap_ms:
+                            break
+
+                        delta, feasible = atsp_two_opt_delta_and_feasible(t, i, k)
+                        evals += 1
+                        if feasible and delta < -EPS:
+                            apply_two_opt_inplace(t, i, k)
+                            moves += 1
+                            improved = True
+                            break
+                    if improved:
+                        break
+                    # also break outer i-loop if caps hit
+                    if evals >= max_evals or moves >= max_moves or (time.perf_counter() - start) * 1000.0 >= time_cap_ms:
+                        break
+
+            improved_offspring.append(t)
+
+        return improved_offspring
     
     # ---- Elimination ----
     def elimination(self, joined_population: list[np.ndarray], joined_fitnesses: np.ndarray, distanceMatrix: np.ndarray) -> Tuple:
@@ -176,6 +283,9 @@ class r1072969:
                 child = self.mutation(child, D)
 
                 offspring.append(child)
+            # --- Local Search ---
+            offspring = self.local_search(offspring, D)
+            
             # evaluate fitness of the offsprings 
             offspring_fitnesses = self._compute_fitness_population(offspring, D)
             joined_fitnesses = np.concatenate((population_fitnesses, offspring_fitnesses))
@@ -368,8 +478,9 @@ class r1072969:
             OX crossover with a light repair attempt: if infeasible, try a few random re-shuffles
             around problematic edges; otherwise fall back to the fitter parent.
         """
-        ops = (self._crossover_OX, self._crossover_ERX)
-        op = self.rng.choice(ops)
+        #ops = (self._crossover_OX, self._crossover_ERX)
+        #op = self.rng.choice(ops)
+        op = self._crossover_OX
         child = op(p1, p2)
         if np.isfinite(self._tour_length(child, D)):
             return child
@@ -597,7 +708,7 @@ if __name__ == '__main__':
 
     a = r1072969(mu=100, lamb=100, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
 
-    a.optimize("./tour1000.csv")
+    a.optimize("./tour250.csv")
     
     #end_time = time.perf_counter()
 
