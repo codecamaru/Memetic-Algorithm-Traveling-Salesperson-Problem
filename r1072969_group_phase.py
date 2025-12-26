@@ -4,6 +4,7 @@
 
 import Reporter
 import numpy as np
+import time
 
 #import psutil
 #import os
@@ -375,7 +376,7 @@ if __name__ == '__main__':
 
     #start_time = time.perf_counter()
 
-    a = r1072969(mu=20, lamb=270, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
+    a = r1072969(mu=100, lamb=100, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
 
     a.optimize("./tour1000.csv")
     

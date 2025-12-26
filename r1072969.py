@@ -4,13 +4,98 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, List, Dict
 from collections import Counter
-import random
 import time
+from numba import jit
 
-#import psutil
-#import os
-#import time
+@jit(nopython=True)
+def fast_two_opt_delta(tour, i, k, distanceMatrix, n):
+    """
+    Compute the change in tour length if we reverse segment (i+1 .. k),
+    and check that all new arcs are finite. Works for directed/asymmetric matrices.
+    JIT-compiled for speed.
+    """
+    if (i + 1) % n == k or (k + 1) % n == i:
+        return 0.0, False
 
+    a = tour[i]
+    b = tour[(i + 1) % n]
+    c = tour[k]
+    d = tour[(k + 1) % n]
+
+    # New endpoint arcs must be finite
+    if not (np.isfinite(distanceMatrix[a, c]) and np.isfinite(distanceMatrix[b, d])):
+        return 0.0, False
+
+    delta = -distanceMatrix[a, b] - distanceMatrix[c, d] + distanceMatrix[a, c] + distanceMatrix[b, d]
+
+    # Internal edges loop - fast in Numba
+    for t in range(i + 1, k):
+        u = tour[t]
+        v = tour[t + 1]
+        
+        # New arc v->u
+        val_vu = distanceMatrix[v, u]
+        if not np.isfinite(val_vu):
+            return 0.0, False
+            
+        val_uv = distanceMatrix[u, v]
+        delta += (val_vu - val_uv)
+
+    return float(delta), True
+
+@jit(nopython=True)
+def fast_tour_length(tour, distanceMatrix, n):
+    """
+    Compute tour length avoiding temporary array allocations.
+    """
+    obj = 0.0
+    for i in range(n):
+        a = tour[i]
+        b = tour[(i + 1) % n]
+        dist = distanceMatrix[a, b]
+        if not np.isfinite(dist):
+            return np.inf
+        obj += dist
+    return float(obj)
+
+@jit(nopython=True)
+def fast_crossover_OX(p1, p2, n, a, b):
+    """
+    Order Crossover (OX) compiled.
+    a, b are the start/end indices (inclusive) of the slice from p1.
+    """
+    child = np.empty(n, dtype=np.int64) # or whatever dtype tour is
+    # Fill with -1 or just track via pointer
+    
+    # We need a boolean mask for used cities
+    used = np.zeros(n, dtype=np.bool_)
+    
+    # 1. Copy slice from p1
+    # Note: b is inclusive here to match Python slice a:b+1
+    count = 0
+    # simple loop to copy and mark used
+    if a <= b: # Normal range
+        for i in range(a, b + 1):
+            val = p1[i]
+            child[i] = val
+            used[val] = True
+    else: 
+        # Should not happen with current python logic which sorts a,b, 
+        # but handled just in case or assume sorted
+        pass 
+        
+    # 2. Fill remaining from p2
+    # Current pos in child to fill
+    pos = (b + 1) % n
+    
+    for i in range(n):
+        city = p2[i]
+        if not used[city]:
+            child[pos] = city
+            # used[city] = True # not strictly needed if we purely fill
+            pos = (pos + 1) % n
+            
+    return child
 
 class r1072969:
     def __init__(self,
@@ -35,7 +120,7 @@ class r1072969:
     # ---- Initialisation ----
     def initialisation(self, distanceMatrix: np.ndarray) -> np.ndarray:
         """ 
-            Generate mu individuals (40% greedy, 60% random), all feasible if possible 
+            Generate mu individuals (50% greedy, 50% random), all feasible if possible 
         """
         n = distanceMatrix.shape[0]
         M = self._finite_outgoing_mask(distanceMatrix)
@@ -48,7 +133,7 @@ class r1072969:
         greedy_tries, random_tries = 0, 0
         max_total_tries = 10_000
         
-        # greedy tours (~40% population)
+        # greedy tours (~50% population)
         while len(population) < num_greedy_individuals and (greedy_tries + random_tries) < max_total_tries:
             greedy_tries += 1 
             try:
@@ -57,7 +142,7 @@ class r1072969:
             except ValueError:
                 continue
 
-        # random tours (~60% population)
+        # random tours (~50% population)
         while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
             random_tries += 1
             try:
@@ -115,106 +200,63 @@ class r1072969:
     # --- Local Search Operator ---
     def local_search(self, offspring: list[np.ndarray], distanceMatrix: np.ndarray) -> list[np.ndarray]:
         """ 
-            2-Opt local search on offspring (directed TSP, supports ∞ entries).
-            First-improvement: for each child, repeatedly apply any improving 2-opt reversal
-            until no improvement is found. Returns the improved offspring list.
+            2-Opt local search using Numba JIT.
         """
         improved_offspring: list[np.ndarray] = []
 
         # --- Budget ---
-        p_ls = 0.8               # apply LS only to ~35% of children (set to 1.0 for all)
-        max_evals = 4000          # max (i,k) evaluations per child
-        max_moves = 120           # max improving reversals applied per child
-        time_cap_ms = 10          # per-child time cap in milliseconds
+        p_ls = 1              # apply LS only to 10% of children
+        max_evals = 50_000     # increased to allow full search
+        max_moves = 2_000       # effectively uncap moves so it finds the local optimum
+        time_cap_ms = 50        # increased time cap per individual
         EPS = 1e-12
-
-        def atsp_two_opt_delta_and_feasible(tour: np.ndarray, i: int, k: int) -> tuple[float, bool]:
-            """
-            Compute the change in tour length if we reverse segment (i+1 .. k),
-            and check that all new arcs are finite. Works for directed/asymmetric matrices.
-
-            Returns (delta, feasible_new_tour).
-            """
-            n = tour.size
-            # adjacency including wrap: reversing a length-1 segment or (0, n-1) is a no-op
-            if (i + 1) % n == k or (k + 1) % n == i:
-                return 0.0, False
-
-            a = tour[i]
-            b = tour[(i + 1) % n]
-            c = tour[k]
-            d = tour[(k + 1) % n]
-
-            # New endpoint arcs must be finite: a->c and b->d
-            if not (np.isfinite(distanceMatrix[a, c]) and np.isfinite(distanceMatrix[b, d])):
-                return 0.0, False
-
-            # Start with endpoint changes
-            delta = -distanceMatrix[a, b] - distanceMatrix[c, d] + distanceMatrix[a, c] + distanceMatrix[b, d]
-
-            # Internal arcs reverse direction: (v_t -> v_{t+1}) becomes (v_{t+1} -> v_t)
-            # Check finiteness and accumulate delta for each flipped arc
-            # Segment (i+1 .. k) includes arcs (t, t+1) for t in [i+1 .. k-1]
-            for t in range(i + 1, k):
-                u = tour[t]
-                v = tour[t + 1]
-                # New arc will be v->u; must be finite
-                if not np.isfinite(distanceMatrix[v, u]):
-                    return 0.0, False
-                delta += (distanceMatrix[v, u] - distanceMatrix[u, v])
-
-            return float(delta), True
-
-        def apply_two_opt_inplace(tour: np.ndarray, i: int, k: int) -> None:
-            """Reverse the segment (i+1 .. k) in place; assumes i < k."""
-            if i > k:
-                i, k = k, i
-            tour[i + 1 : k + 1] = tour[i + 1 : k + 1][::-1]
-
+        TIME_CHECK_FREQ = 64
+        
         for child in offspring:
-            # Probabilistic LS to control runtime
             if self.rng.random() >= p_ls:
                 improved_offspring.append(child)
                 continue
 
             t = child.copy()
-            # Skip clearly infeasible tours
             if not np.isfinite(self._tour_length(t, distanceMatrix)):
                 improved_offspring.append(t)
                 continue
 
             n = t.size
-            start = time.perf_counter()
+            start_time = time.perf_counter()
             evals = 0
             moves = 0
             
             improved = True
             while improved:
                 improved = False
-                # First-improvement sweep with budgets
                 for i in range(n):
                     for k in range(i + 2, n):
                         if i == 0 and k == n - 1:
-                            continue  # wrap-adjacent
-                        # Budget checks (cheap and frequent)
-                        if evals >= max_evals or moves >= max_moves:
-                            break
-                        if (time.perf_counter() - start) * 1000.0 >= time_cap_ms:
-                            break
+                            pass 
+                        else:
+                            # Use Numba function
+                            delta, feasible = fast_two_opt_delta(t, i, k, distanceMatrix, n)
+                            evals += 1
+                            
+                            if feasible and delta < -EPS:
+                                t[i + 1 : k + 1] = t[i + 1 : k + 1][::-1]
+                                moves += 1
+                                improved = True
+                                break 
+                        
+                        if evals & TIME_CHECK_FREQ == 0:
+                             if evals >= max_evals or moves >= max_moves or (time.perf_counter() - start_time) * 1000.0 >= time_cap_ms:
+                                improved = False
+                                break
 
-                        delta, feasible = atsp_two_opt_delta_and_feasible(t, i, k)
-                        evals += 1
-                        if feasible and delta < -EPS:
-                            apply_two_opt_inplace(t, i, k)
-                            moves += 1
-                            improved = True
-                            break
                     if improved:
+                        break 
+                        
+                    if evals >= max_evals or moves >= max_moves or (time.perf_counter() - start_time) * 1000.0 >= time_cap_ms:
+                        improved = False
                         break
-                    # also break outer i-loop if caps hit
-                    if evals >= max_evals or moves >= max_moves or (time.perf_counter() - start) * 1000.0 >= time_cap_ms:
-                        break
-
+                        
             improved_offspring.append(t)
 
         return improved_offspring
@@ -225,7 +267,6 @@ class r1072969:
             (μ+λ) Elimination with duplicate filtering 
         """
         mu = self.mu
-        D = distanceMatrix
         
         order_indices = np.argsort(joined_fitnesses, kind='mergesort')
         sorted_population = [joined_population[i] for i in order_indices]
@@ -233,7 +274,7 @@ class r1072969:
 
         sorted_population = self._unique_by_tuple(sorted_population) # Remove duplicates to preserve some diversity
         # Recompute fitness for the filtered ordering
-        sorted_fitnesses = self._compute_fitness_population(sorted_population, D)
+        sorted_fitnesses = self._compute_fitness_population(sorted_population, distanceMatrix)
 
         # Keep top μ
         population = sorted_population[:mu]
@@ -262,10 +303,10 @@ class r1072969:
         best_tour = population[best_idx].copy()
         best_fit = float(population_fitnesses[best_idx])
         
-        diversity_counts: list[int] = []
+        #diversity_counts: list[int] = []
         
         lamb = self.lamb
-
+        
         # ===== Evolutionary loop =====
         yourConvergenceTestsHere = True
         while yourConvergenceTestsHere:
@@ -284,8 +325,9 @@ class r1072969:
 
                 offspring.append(child)
             # --- Local Search ---
-            offspring = self.local_search(offspring, D)
+            #offspring = self.local_search(offspring, D)
             
+            # --- Diversity promotion ---
             # evaluate fitness of the offsprings 
             offspring_fitnesses = self._compute_fitness_population(offspring, D)
             joined_fitnesses = np.concatenate((population_fitnesses, offspring_fitnesses))
@@ -309,14 +351,14 @@ class r1072969:
             bestSolution = best_tour.astype(int)
             
             # track diversity (unique edges)
-            diversity_counts.append(self._count_unique_edges_in_population(population, D))
+            #diversity_counts.append(self._count_unique_edges_in_population(population, D))
 
             timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
             if timeLeft < 0:
                 break
         
         # Plot and save diversity evolution
-        self._diversity_plot_unique_edges(diversity_counts)
+        #self._diversity_plot_unique_edges(diversity_counts)
 
         return 0
     
@@ -446,7 +488,7 @@ class r1072969:
         return child
 
     def _mutate_invert(self, tour: np.ndarray) -> np.ndarray:
-        """ 
+        """
             Pick two indices at random and invert the path from i to j
             Return the resulting tour 
         """
@@ -466,6 +508,7 @@ class r1072969:
         for _ in range(self.feasible_retry):
             op = self.rng.choice(ops)
             child = op(parent)
+            #child = self._mutate_swap(parent)
             if np.isfinite(self._tour_length(child, D)):
                 return child
         return parent
@@ -480,8 +523,7 @@ class r1072969:
         """
         #ops = (self._crossover_OX, self._crossover_ERX)
         #op = self.rng.choice(ops)
-        op = self._crossover_OX
-        child = op(p1, p2)
+        child = self._crossover_OX(p1, p2)
         if np.isfinite(self._tour_length(child, D)):
             return child
 
@@ -513,25 +555,20 @@ class r1072969:
             cities from p2. Produces a permutation (not guaranteed feasible in directed sense).
         """
         n = p1.size
-        a, b = sorted(self.rng.choice(n, size=2, replace=False))
-        child = -np.ones(n, dtype=int)
+        # Get random slice indices using the class RNG (preserving seed control)
+        rand_indices = self.rng.choice(n, size=2, replace=False)
+        # sort them manually or via numpy
+        if rand_indices[0] < rand_indices[1]:
+            a, b = rand_indices[0], rand_indices[1]
+        else:
+            a, b = rand_indices[1], rand_indices[0]
+            
+        # Call JIT function
+        # Ensure suitable types (p1, p2 usually int64 or int32)
+        return fast_crossover_OX(p1, p2, n, a, b)
 
-        # Copy slice from p1
-        child[a:b+1] = p1[a:b+1]
-        used = np.zeros(n, dtype=bool)
-        used[child[a:b+1]] = True
-
-        # Fill remaining positions with p2 order
-        pos = (b + 1) % n
-        for city in p2:
-            if not used[city]:
-                child[pos] = city
-                used[city] = True
-                pos = (pos + 1) % n
-        return child
-
-    def _crossover_ERX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
-        """
+    """def _crossover_ERX(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+        
             Edge Recombination Crossover (ERX / Edge Crossover).
             Constructs an adjacency (edge) table from both parents and builds a child by
             repeatedly choosing the next city based on:
@@ -544,7 +581,7 @@ class r1072969:
                 p2: Parent 2 as a permutation (np.ndarray of ints 0..n-1).
             Returns:
                 child: A valid permutation (np.ndarray of dtype=int).
-        """
+        
         n = p1.size
         child = -np.ones(n, dtype=int)
         used = np.zeros(n, dtype=bool)
@@ -553,8 +590,7 @@ class r1072969:
         succ_edges: Dict[int, List[int]] = {int(c): [] for c in p1}
         def add_parent_successors(parent: np.ndarray):
             for i, c in enumerate(parent):
-                c = int(c)
-                right = int(parent[(i + 1) % n])   # successor only
+                c = int(parent[(i + 1) % n])   # successor only
                 succ_edges[c].append(right)
 
         add_parent_successors(p1)
@@ -598,7 +634,7 @@ class r1072969:
             current = next_city
             remove_city_from_all(current)
 
-        return child
+        return child"""
 
     # ===========================
     # ---- Selection helpers ----
@@ -611,13 +647,14 @@ class r1072969:
         cand = self.rng.integers(0, n, size=k)
         winner = cand[np.argmin(fitness[cand])]
         return int(winner)
-    
+        
     @staticmethod
     def _compute_fitness_population(population: list[np.ndarray], D: np.ndarray) -> np.ndarray:
         """ 
             Compute objective function for each tour 
             Returns an array of fitnesses 
         """
+        # Call the instance method or static method? _tour_length is static.
         return np.array([r1072969._tour_length(t, D) for t in population], dtype=float)
     
     # ===========================
@@ -662,13 +699,7 @@ class r1072969:
         """
             Compute directed cycle length. Returns np.inf if any edge is infeasible (∞).
         """
-        idx = tour
-        nxt = np.roll(idx, -1)
-        edges = D[idx, nxt]
-        # If any edge is non-finite, tour is infeasible
-        if np.isfinite(edges).all():
-            return float(edges.sum())
-        return float(np.inf)
+        return fast_tour_length(tour, D, tour.size)
 
     @staticmethod
     def _finite_outgoing_mask(D: np.ndarray) -> np.ndarray:
@@ -706,9 +737,9 @@ if __name__ == '__main__':
 
     #start_time = time.perf_counter()
 
-    a = r1072969(mu=100, lamb=100, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6000000000000001)
+    a = r1072969(mu=100, lamb=100, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6)
 
-    a.optimize("./tour250.csv")
+    a.optimize("./tour750.csv")
     
     #end_time = time.perf_counter()
 
