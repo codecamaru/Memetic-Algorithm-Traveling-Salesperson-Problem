@@ -168,14 +168,331 @@ def fast_greedy_search_replacement(tour, distanceMatrix):
         
     return new_tour
 
+@jit(nopython=True)
+def fast_select_winner(fitness, candidates):
+    """
+    Tournament selection winner: index with lowest fitness among candidates.
+    """
+    best_idx = candidates[0]
+    best_fit = fitness[candidates[0]]
+    
+    for i in range(1, len(candidates)):
+        idx = candidates[i]
+        fit = fitness[idx]
+        if fit < best_fit:
+            best_fit = fit
+            best_idx = idx
+    return best_idx
+
+@jit(nopython=True)
+def fast_mutate_swap(tour, i, j):
+    """
+    Swap elements at indices i and j.
+    """
+    child = tour.copy()
+    val_i = child[i]
+    child[i] = child[j]
+    child[j] = val_i
+    return child
+
+@jit(nopython=True)
+def fast_mutate_invert(tour, i, j):
+    """
+    Invert segment between i and j (inclusive).
+    """
+    if i > j:
+        i, j = j, i
+    child = tour.copy()
+    # Numba supports standard slice assignment
+    child[i : j + 1] = child[i : j + 1][::-1]
+    return child
+
+@jit(nopython=True)
+def fast_two_opt_search_inner(tour, distanceMatrix, max_evals, max_moves, time_limit_ignored=0):
+    """
+    Inner loop of 2-opt local search.
+    Returns the improved tour.
+    """
+    t = tour.copy()
+    n = len(t)
+    EPS = 1e-12
+    
+    # We cannot use time.perf_counter() in nopython mode easily without objmode, 
+    # so we rely on max_evals/max_moves to bound execution.
+    evals = 0
+    moves = 0
+    improved = True
+    
+    while improved:
+        improved = False
+        for i in range(n):
+            for k in range(i + 2, n):
+                if i == 0 and k == n - 1:
+                    pass 
+                else:
+                    delta, feasible = fast_two_opt_delta(t, i, k, distanceMatrix, n)
+                    evals += 1
+                    
+                    if feasible and delta < -EPS:
+                        # Apply move
+                        t[i + 1 : k + 1] = t[i + 1 : k + 1][::-1]
+                        moves += 1
+                        improved = True
+                        # restart search from first improvement (first improvement strategy)
+                        # or break to restart outer loop?
+                        # The original code did `break` then `if improved: break` to restart the while loop.
+                        break 
+                
+                # Check limits
+                if evals >= max_evals or moves >= max_moves:
+                    return t
+
+            if improved:
+                # Restart the scanner
+                break 
+                
+            if evals >= max_evals or moves >= max_moves:
+                return t
+                
+    return t
+
+@jit(nopython=True)
+def fast_three_opt_search(tour, distanceMatrix, max_evals):
+    """
+    Apply 3-opt reconnection.
+    We iterate over 3 cuts (i, j, k) and try to reconnect segments [start..i], [i+1..j], [j+1..k], [k+1..end]
+    in a way that does NOT reverse strict sub-segments (to avoid infinite edges in asymmetric TSP),
+    but effectively permutes the ordering of the 3 mutable segments.
+    
+    Segments:
+    A: 0...i
+    B: i+1...j
+    C: j+1...k
+    D: k+1...n-1 (implicit end)
+    
+    Standard cycle: A -> B -> C -> D -> A
+    
+    Possible non-reversing reconnects involved moving B or C.
+    For example: A -> C -> B -> D -> A
+    
+    This is equivalent to a 'shift' or 'reinsertion' move in some contexts.
+    """
+    t = tour.copy()
+    n = len(t)
+    EPS = 1e-12
+    improved = True
+    evals = 0
+    
+    while improved:
+        improved = False
+        # We need 3 cuts.
+        # i from 0 to n-3
+        # j from i+1 to n-2
+        # k from j+1 to n-1
+        
+        # Limit search space for performance if needed, but here we try logic
+        for i in range(n - 5): # heuristic buffer
+            a = t[i]
+            b = t[i+1] # outgoing edge from A
+            if not np.isfinite(distanceMatrix[a, b]): continue
+            
+            for j in range(i + 2, n - 3):
+                c = t[j]
+                d = t[j+1]
+                if not np.isfinite(distanceMatrix[c, d]): continue
+                
+                # We check the move: A->C... -> B... -> D...
+                # i.e. insert segment C (from j+1 to k) between A and B
+                
+                for k in range(j + 2, n - 1):
+                    e = t[k]
+                    f = t[k+1]
+                    if not np.isfinite(distanceMatrix[e, f]): continue
+                    
+                    evals += 1
+                    
+                    # Current edges: (a,b), (c,d), (e,f)
+                    # Cost removed: D[a,b] + D[c,d] + D[e,f]
+                    current_cost = distanceMatrix[a,b] + distanceMatrix[c,d] + distanceMatrix[e,f]
+                    
+                    # Candidate geometry: A -> (j+1...k) -> (i+1...j) -> (k+1...)
+                    # New edges: (a, t[j+1]), (t[k], t[i+1]), (t[j], f)
+                    # Let's map these points:
+                    # u = t[j+1] (start of segment 3)
+                    # v = t[k] (end of segment 3)
+                    # w = t[i+1] (start of segment 2)
+                    # x = t[j] (end of segment 2)
+                    
+                    u = t[j+1]
+                    v = t[k]
+                    w = t[i+1]
+                    x = t[j]
+                    
+                    if np.isfinite(distanceMatrix[a, u]) and np.isfinite(distanceMatrix[v, w]) and np.isfinite(distanceMatrix[x, f]):
+                        new_cost = distanceMatrix[a, u] + distanceMatrix[v, w] + distanceMatrix[x, f]
+                        if new_cost < current_cost - EPS:
+                            # Apply shift: 
+                            # Old: [...i] [i+1...j] [j+1...k] [k+1...]
+                            # New: [...i] [j+1...k] [i+1...j] [k+1...]
+                            
+                            # Construct new tour array
+                            # 1. 0..i
+                            # 2. j+1..k
+                            # 3. i+1..j
+                            # 4. k+1..n
+                            
+                            # It's faster to do slice assignment if we are careful
+                            # But standard numpy concatenate often easier to reason about for 3 parts
+                            
+                            seg1 = t[0 : i+1]
+                            seg2 = t[i+1 : j+1]
+                            seg3 = t[j+1 : k+1]
+                            seg4 = t[k+1 : n]
+                            
+                            t = np.concatenate((seg1, seg3, seg2, seg4))
+                            improved = True
+                            break
+                            
+                    if evals > max_evals:
+                        return t
+                if improved: break
+            if improved: break
+            
+    return t
+
+@jit(nopython=True)
+def fast_crossover_ERX(p1, p2, n, rand_vals):
+    """
+    Edge Recombination Crossover (ERX) optimized with Numba.
+    Builds a child preserving adjacency information from parents.
+    
+    rand_vals: Array of random floats [0, 1) to use for decision making.
+    """
+    # 1. Build Adjacency Map (Directed)
+    # Max degree is 2 (one from p1, one from p2)
+    # We use a flat array or fixed size matrix: adj[city, 0] and adj[city, 1]
+    # -1 means empty
+    adj = np.full((n, 2), -1, dtype=np.int32)
+    
+    # Fill from P1
+    for i in range(n):
+        u = p1[i]
+        v = p1[(i + 1) % n]
+        adj[u, 0] = v
+        
+    # Fill from P2
+    for i in range(n):
+        u = p2[i]
+        v = p2[(i + 1) % n]
+        if adj[u, 0] != v:
+            adj[u, 1] = v
+    
+    # Track used
+    used = np.zeros(n, dtype=np.bool_)
+    child = np.empty(n, dtype=np.int32)
+    
+    # Pick start node (from p1[0] usually)
+    curr = p1[0]
+    child[0] = curr
+    used[curr] = True
+    
+    rand_idx = 0
+    max_rand = len(rand_vals)
+    
+    for i in range(1, n):
+        # Determine candidates from adj[curr]
+        c1 = adj[curr, 0]
+        c2 = adj[curr, 1]
+        
+        # Scalar candidates
+        candA = -1
+        candB = -1
+        num_cands = 0
+        
+        if c1 != -1 and not used[c1]:
+            candA = c1
+            num_cands = 1
+        
+        if c2 != -1 and c2 != c1 and not used[c2]:
+            if num_cands == 0:
+                candA = c2
+                num_cands = 1
+            else:
+                candB = c2
+                num_cands = 2
+            
+        best_cand = -1
+        
+        if num_cands > 0:
+            # Pick neighbor with fewest unused neighbors
+            
+            # Evaluate candA
+            degA = 0
+            n1 = adj[candA, 0]
+            n2 = adj[candA, 1]
+            if n1 != -1 and not used[n1]: degA += 1
+            if n2 != -1 and n2 != n1 and not used[n2]: degA += 1
+            
+            min_deg = degA
+            best_cand = candA
+            tie_count = 1
+            
+            if num_cands > 1:
+                # Evaluate candB
+                degB = 0
+                n1 = adj[candB, 0]
+                n2 = adj[candB, 1]
+                if n1 != -1 and not used[n1]: degB += 1
+                if n2 != -1 and n2 != n1 and not used[n2]: degB += 1
+                
+                if degB < min_deg:
+                    min_deg = degB
+                    best_cand = candB
+                    tie_count = 1
+                elif degB == min_deg:
+                    tie_count = 2
+                    
+            # Selection from ties
+            if tie_count == 2:
+                # Random choice between candA and candB
+                r = rand_vals[rand_idx % max_rand]
+                rand_idx += 1
+                if r < 0.5:
+                    best_cand = candA
+                else:
+                    best_cand = candB
+                
+        else:
+            # Dead end: Random jump
+            r = rand_vals[rand_idx % max_rand]
+            rand_idx += 1
+            start_scan = int(r * n)
+            
+            found = False
+            for k in range(n):
+                idx = (start_scan + k) % n
+                if not used[idx]:
+                    best_cand = idx
+                    found = True
+                    break
+            if not found:
+                # This should not happen
+                best_cand = 0 
+                
+        child[i] = best_cand
+        used[best_cand] = True
+        curr = best_cand
+        
+    return child
+
 class r1072969:
     def __init__(self,
                  rng_seed: int | None = None,
-                 mu: int = 100,                         # population size (optional: auto if None) ¿?
+                 mu: int = 100,                         # population size (optional: auto if None) 
                  lamb: int = 100,                       # offspring per generation (optional: auto if None)
                  k_tournament: int = 3,                 # tournament size (optional: auto if None)
-                 mutation_rate: float = 0.9,       # probability to mutate a selected parent ¿?
-                 crossover_rate: float = 0.9,      # probability to recombine two parents ¿?
+                 mutation_rate: float = 0.6,       # probability to mutate a selected parent 
+                 crossover_rate: float = 0.9,      # probability to recombine two parents 
                  feasible_retry: int = 20,         # retries to obtain a feasible variation
                  greedy_search_replacement_prob: float = 0.2 # probability to apply greedy search replacement (as percentage of worst population)
                  ):
@@ -193,7 +510,7 @@ class r1072969:
     # ---- Initialisation ----
     def initialisation(self, distanceMatrix: np.ndarray) -> np.ndarray:
         """ 
-            Generate mu individuals (50% greedy, 50% random), all feasible if possible 
+            Generate mu individuals (90% greedy, 10% random), all feasible if possible 
         """
         n = distanceMatrix.shape[0]
         M = self._finite_outgoing_mask(distanceMatrix)
@@ -201,12 +518,12 @@ class r1072969:
    
         population: list[np.ndarray] = []
 
-        num_greedy_individuals = max(1, int(round(0.7 * mu))) # ensure at least 1 greedy
+        num_greedy_individuals = max(1, int(round(0.9 * mu))) # ensure at least 1 greedy
     
         greedy_tries, random_tries = 0, 0
         max_total_tries = 10_000
         
-        # greedy tours (~50% population)
+        # greedy tours (~90% population)
         while len(population) < num_greedy_individuals and (greedy_tries + random_tries) < max_total_tries:
             greedy_tries += 1 
             try:
@@ -215,7 +532,7 @@ class r1072969:
             except ValueError:
                 continue
 
-        # random tours (~50% population)
+        # random tours (~10% population)
         while len(population) < mu and (greedy_tries + random_tries) < max_total_tries:
             random_tries += 1
             try:
@@ -281,9 +598,10 @@ class r1072969:
             return self.two_opt_local_search(offspring, distanceMatrix)
     def greedy_search_replacement(self, offspring: list[np.ndarray], distanceMatrix: np.ndarray) -> list[np.ndarray]:
         """ 
-            Applies the greedy search replacement operator to the worst 'greedy_search_replacement_prob' 
+            Applies the greedy search replacement operator to the worst 'greedy_search_replacement_proportion' 
             fraction of the offspring.
         """
+        greedy_search_replacement_proportion = 0.2
         # Calculate fitness for all offspring
         offspring_fitnesses = self._compute_fitness_population(offspring, distanceMatrix)
         
@@ -292,7 +610,7 @@ class r1072969:
         sorted_indices = np.argsort(offspring_fitnesses)
         
         n = len(offspring)
-        n_worst = int(n * self.greedy_search_replacement_prob)
+        n_worst = int(n * greedy_search_replacement_proportion)
         
         # Identify indices of the worst tours
         # If n_worst is 0, we do nothing
@@ -318,7 +636,7 @@ class r1072969:
         improved_offspring: list[np.ndarray] = []
 
         # --- Budget ---
-        p_ls = 0.3             # apply LS only to 10% of children
+        p_ls = 0.6             # apply LS only to 40% of children
         max_evals = 50_000     # increased to allow full search
         max_moves = 2_000       # effectively uncap moves so it finds the local optimum
         time_cap_ms = 50        # increased time cap per individual
@@ -340,35 +658,12 @@ class r1072969:
             evals = 0
             moves = 0
             
-            improved = True
-            while improved:
-                improved = False
-                for i in range(n):
-                    for k in range(i + 2, n):
-                        if i == 0 and k == n - 1:
-                            pass 
-                        else:
-                            # Use Numba function
-                            delta, feasible = fast_two_opt_delta(t, i, k, distanceMatrix, n)
-                            evals += 1
-                            
-                            if feasible and delta < -EPS:
-                                t[i + 1 : k + 1] = t[i + 1 : k + 1][::-1]
-                                moves += 1
-                                improved = True
-                                break 
-                        
-                        if evals & TIME_CHECK_FREQ == 0:
-                             if evals >= max_evals or moves >= max_moves or (time.perf_counter() - start_time) * 1000.0 >= time_cap_ms:
-                                improved = False
-                                break
-
-                    if improved:
-                        break 
-                        
-                    if evals >= max_evals or moves >= max_moves or (time.perf_counter() - start_time) * 1000.0 >= time_cap_ms:
-                        improved = False
-                        break
+            evals = 0
+            moves = 0
+            
+            # Use JIT-compiled inner loop
+            # We ignore time_cap_ms within the JIT function for now, relying on max_evals/max_moves
+            t = fast_two_opt_search_inner(t, distanceMatrix, max_evals, max_moves, 0)
                         
             improved_offspring.append(t)
 
@@ -421,6 +716,10 @@ class r1072969:
         lamb = self.lamb
         
         # ===== Evolutionary loop =====
+        self.best_fitness_history = []
+        self.stagnation_counter = 0
+        STAGNATION_LIMIT = 5
+        
         yourConvergenceTestsHere = True
         while yourConvergenceTestsHere:
             # ---------- Create offspring ----------
@@ -454,9 +753,44 @@ class r1072969:
             # tracking best
             gen_best_idx = int(np.argmin(population_fitnesses))
             gen_best_fit = float(population_fitnesses[gen_best_idx])
+            
+            # Stagnation check
             if gen_best_fit < best_fit:
                 best_fit = gen_best_fit
                 best_tour = population[gen_best_idx].copy()
+                self.stagnation_counter = 0
+            else:
+                self.stagnation_counter += 1
+                
+            # Apply 3-opt if stagnated
+            if self.stagnation_counter >= STAGNATION_LIMIT:
+                print(f"Stagnation detected ({self.stagnation_counter} gens). Applying 3-opt to top individuals.")
+                self.stagnation_counter = 0 # reset or keep counting? Reset to give it time to work.
+                
+                # Apply 3-opt to the best half of population to try and break out
+                # or just the top K?
+                # Let's do top 10% or at least 5 individuals
+                k_dest = max(5, int(0.1 * self.mu))
+                
+                # Population is already sorted by fitness from elimination step? 
+                # elimination returns sorted population usually?
+                # "population = sorted_population[:mu]" in elimination. 
+                # Yes, index 0 is best.
+                
+                for i in range(k_dest):
+                    # Heavy local search
+                    improved_tour = fast_three_opt_search(population[i], D, max_evals=100_000)
+                    population[i] = improved_tour
+                    
+                # Re-evaluate population fitness after 3-opt modifications
+                population_fitnesses = self._compute_fitness_population(population, D)
+                
+                # Re-check best after 3-opt
+                gen_best_idx = int(np.argmin(population_fitnesses))
+                gen_best_fit = float(population_fitnesses[gen_best_idx])
+                if gen_best_fit < best_fit:
+                    best_fit = gen_best_fit
+                    best_tour = population[gen_best_idx].copy()
 
             # reporting
             meanObjective = float(np.mean(population_fitnesses))
@@ -514,7 +848,7 @@ class r1072969:
                     feasible = False
                     break
                 # randomized choice among up to top 5 nearest to promote diversity
-                k = min(3, cand.size)
+                k = min(1, cand.size)
                 next_city = self.rng.choice(cand[:k])
                 tour[pos] = next_city
                 used[next_city] = True
@@ -596,9 +930,7 @@ class r1072969:
             Return the resulting tour
         """
         i, j = self.rng.choice(tour.size, size=2, replace=False)
-        child = tour.copy()
-        child[i], child[j] = child[j], child[i]
-        return child
+        return fast_mutate_swap(tour, i, j)
 
     def _mutate_invert(self, tour: np.ndarray) -> np.ndarray:
         """
@@ -608,9 +940,7 @@ class r1072969:
         i, j = self.rng.choice(tour.size, size=2, replace=False)
         if i > j:
             i, j = j, i
-        child = tour.copy()
-        child[i:j+1] = child[i:j+1][::-1]
-        return child
+        return fast_mutate_invert(tour, i, j)
 
     def _mutate_feasible(self, parent: np.ndarray, D: np.ndarray) -> np.ndarray:
         """
@@ -631,12 +961,20 @@ class r1072969:
     # ==========================
     def _recombine_feasible(self, p1: np.ndarray, p2: np.ndarray, D: np.ndarray) -> np.ndarray:
         """
-            OX crossover with a light repair attempt: if infeasible, try a few random re-shuffles
-            around problematic edges; otherwise fall back to the fitter parent.
+            Crossover with random choice between OX and ERX.
+            If infeasible, try a few random re-shuffles around problematic edges; 
+            otherwise fall back to the fitter parent.
         """
-        #ops = (self._crossover_OX, self._crossover_ERX)
-        #op = self.rng.choice(ops)
-        child = self._crossover_OX(p1, p2)
+        if self.rng.random() < 0.5:
+            child = self._crossover_OX(p1, p2)
+        else:
+            # ERX
+            n = p1.size
+            # Pre-generate random values for usage inside JIT
+            # We need at most N decisions
+            rand_vals = self.rng.random(size=n + 50, dtype=np.float64) # float64 default
+            child = fast_crossover_ERX(p1, p2, n, rand_vals)
+
         if np.isfinite(self._tour_length(child, D)):
             return child
 
@@ -758,7 +1096,7 @@ class r1072969:
         """
         n = fitness.size
         cand = self.rng.integers(0, n, size=k)
-        winner = cand[np.argmin(fitness[cand])]
+        winner = fast_select_winner(fitness, cand)
         return int(winner)
         
     @staticmethod
@@ -850,9 +1188,9 @@ if __name__ == '__main__':
 
     #start_time = time.perf_counter()
 
-    a = r1072969(mu=100, lamb=100, k_tournament=7, mutation_rate=0.8, crossover_rate=0.6)
+    a = r1072969(mu=500, lamb=500, k_tournament=5, mutation_rate=0.8, crossover_rate=0.5)
 
-    a.optimize("./tour750.csv")
+    a.optimize("./tour1000.csv")
     
     #end_time = time.perf_counter()
 
