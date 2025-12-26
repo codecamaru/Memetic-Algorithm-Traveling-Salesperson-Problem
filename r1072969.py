@@ -97,6 +97,77 @@ def fast_crossover_OX(p1, p2, n, a, b):
             
     return child
 
+@jit(nopython=True)
+def fast_greedy_search_replacement(tour, distanceMatrix):
+    """
+    Reconstructs a tour started from its lowest-cost edge, extending it 
+    by greedily visiting the nearest unvisited neighbor.
+    Returns the original tour if reconstruction fails or is infeasible.
+    """
+    n = len(tour)
+    
+    # 1. Find the edge in the current tour with the lowest cost
+    best_u = -1
+    best_v = -1
+    min_dist = np.inf
+    
+    # Iterate through current tour edges
+    for i in range(n):
+        u = tour[i]
+        v = tour[(i + 1) % n]
+        d = distanceMatrix[u, v]
+        # We look for the minimum edge weight
+        if d < min_dist:
+            min_dist = d
+            best_u = u
+            best_v = v
+            
+    # If the best edge is infinite (infeasible), return parent
+    if not np.isfinite(min_dist):
+        return tour
+
+    # 2. Initialize new tour with the best edge
+    new_tour = np.empty(n, dtype=tour.dtype)
+    used = np.zeros(n, dtype=np.bool_)
+    
+    new_tour[0] = best_u
+    new_tour[1] = best_v
+    used[best_u] = True
+    used[best_v] = True
+    
+    current_pos = 1
+    current_node = best_v
+    
+    # 3. Greedily fill the rest of the tour
+    for _ in range(2, n):
+        # Find closest unvisited neighbor to current_node
+        best_cand = -1
+        best_cand_dist = np.inf
+        
+        # Linear scan for the nearest unvisited neighbor
+        for cand in range(n):
+            if not used[cand]:
+                d_cand = distanceMatrix[current_node, cand]
+                if np.isfinite(d_cand):
+                    if d_cand < best_cand_dist:
+                        best_cand_dist = d_cand
+                        best_cand = cand
+        
+        if best_cand == -1:
+            # No reachable unvisited neighbor found -> failure
+            return tour
+            
+        current_pos += 1
+        new_tour[current_pos] = best_cand
+        used[best_cand] = True
+        current_node = best_cand
+        
+    # 4. Check if the cycle can be closed
+    if not np.isfinite(distanceMatrix[new_tour[-1], new_tour[0]]):
+        return tour
+        
+    return new_tour
+
 class r1072969:
     def __init__(self,
                  rng_seed: int | None = None,
@@ -105,7 +176,8 @@ class r1072969:
                  k_tournament: int = 3,                 # tournament size (optional: auto if None)
                  mutation_rate: float = 0.9,       # probability to mutate a selected parent ¿?
                  crossover_rate: float = 0.9,      # probability to recombine two parents ¿?
-                 feasible_retry: int = 20          # retries to obtain a feasible variation
+                 feasible_retry: int = 20,         # retries to obtain a feasible variation
+                 greedy_search_replacement_prob: float = 0.2 # probability to apply greedy search replacement (as percentage of worst population)
                  ):
         self.reporter = Reporter.Reporter(self.__class__.__name__)
         self.rng = np.random.default_rng(rng_seed)
@@ -116,6 +188,7 @@ class r1072969:
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
         self.feasible_retry = feasible_retry
+        self.greedy_search_replacement_prob = greedy_search_replacement_prob
         
     # ---- Initialisation ----
     def initialisation(self, distanceMatrix: np.ndarray) -> np.ndarray:
@@ -128,7 +201,7 @@ class r1072969:
    
         population: list[np.ndarray] = []
 
-        num_greedy_individuals = max(1, int(round(0.99 * mu))) # ensure at least 1 greedy
+        num_greedy_individuals = max(1, int(round(0.7 * mu))) # ensure at least 1 greedy
     
         greedy_tries, random_tries = 0, 0
         max_total_tries = 10_000
@@ -200,12 +273,52 @@ class r1072969:
     # --- Local Search Operator ---
     def local_search(self, offspring: list[np.ndarray], distanceMatrix: np.ndarray) -> list[np.ndarray]:
         """ 
+            Applies the local search operator to the offspring.
+        """
+        if self.rng.random() < 0.3:
+            return self.greedy_search_replacement(offspring, distanceMatrix)
+        else:
+            return self.two_opt_local_search(offspring, distanceMatrix)
+    def greedy_search_replacement(self, offspring: list[np.ndarray], distanceMatrix: np.ndarray) -> list[np.ndarray]:
+        """ 
+            Applies the greedy search replacement operator to the worst 'greedy_search_replacement_prob' 
+            fraction of the offspring.
+        """
+        # Calculate fitness for all offspring
+        offspring_fitnesses = self._compute_fitness_population(offspring, distanceMatrix)
+        
+        # Sort indices: low fitness (good) -> high fitness (bad)
+        # We want the worst ones, which are at the end of the sorted array
+        sorted_indices = np.argsort(offspring_fitnesses)
+        
+        n = len(offspring)
+        n_worst = int(n * self.greedy_search_replacement_prob)
+        
+        # Identify indices of the worst tours
+        # If n_worst is 0, we do nothing
+        if n_worst > 0:
+            worst_indices = set(sorted_indices[-n_worst:])
+        else:
+            worst_indices = set()
+
+        new_offspring = []
+        for i, child in enumerate(offspring):
+            if i in worst_indices:
+                new_child = fast_greedy_search_replacement(child, distanceMatrix)
+                new_offspring.append(new_child)
+            else:
+                new_offspring.append(child)
+                
+        return new_offspring
+
+    def two_opt_local_search(self, offspring: list[np.ndarray], distanceMatrix: np.ndarray) -> list[np.ndarray]:
+        """ 
             2-Opt local search using Numba JIT.
         """
         improved_offspring: list[np.ndarray] = []
 
         # --- Budget ---
-        p_ls = 1              # apply LS only to 10% of children
+        p_ls = 0.3             # apply LS only to 10% of children
         max_evals = 50_000     # increased to allow full search
         max_moves = 2_000       # effectively uncap moves so it finds the local optimum
         time_cap_ms = 50        # increased time cap per individual
@@ -325,7 +438,7 @@ class r1072969:
 
                 offspring.append(child)
             # --- Local Search ---
-            #offspring = self.local_search(offspring, D)
+            offspring = self.local_search(offspring, D)
             
             # --- Diversity promotion ---
             # evaluate fitness of the offsprings 
@@ -401,7 +514,7 @@ class r1072969:
                     feasible = False
                     break
                 # randomized choice among up to top 5 nearest to promote diversity
-                k = min(5, cand.size)
+                k = min(3, cand.size)
                 next_city = self.rng.choice(cand[:k])
                 tour[pos] = next_city
                 used[next_city] = True
