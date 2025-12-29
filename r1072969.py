@@ -208,6 +208,44 @@ def fast_mutate_invert(tour, i, j):
     return child
 
 @jit(nopython=True)
+def fast_mutate_insert(tour, i, j):
+    """
+    Remove element at index i and insert it at index j.
+    """
+    if i == j:
+        return tour.copy()
+    
+    n = len(tour)
+    child = np.empty(n, dtype=tour.dtype)
+    
+    # We want to place element 'val' = tour[i] at index 'j'
+    # There are two cases: i < j and i > j
+    val = tour[i]
+    
+    if i < j:
+        # Shift elements between i+1 and j down by one
+        # [0...i-1] stays same
+        child[0:i] = tour[0:i]
+        # [i...j-1] comes from [i+1...j]
+        child[i:j] = tour[i+1:j+1]
+        # [j] is val
+        child[j] = val
+        # [j+1...n] stays same
+        child[j+1:] = tour[j+1:]
+    else:
+        # i > j
+        # [0...j-1] stays same
+        child[0:j] = tour[0:j]
+        # [j] is val
+        child[j] = val
+        # [j+1...i] comes from [j...i-1]
+        child[j+1:i+1] = tour[j:i]
+        # [i+1...n] stays same
+        child[i+1:] = tour[i+1:]
+        
+    return child
+
+@jit(nopython=True)
 def fast_two_opt_search_inner(tour, distanceMatrix, max_evals, max_moves, time_limit_ignored=0):
     """
     Inner loop of 2-opt local search.
@@ -490,9 +528,9 @@ class r1072969:
                  rng_seed: int | None = None,
                  mu: int = 100,                         # population size (optional: auto if None) 
                  lamb: int = 100,                       # offspring per generation (optional: auto if None)
-                 k_tournament: int = 3,                 # tournament size (optional: auto if None)
-                 mutation_rate: float = 0.6,       # probability to mutate a selected parent 
-                 crossover_rate: float = 0.9,      # probability to recombine two parents 
+                 k_tournament: int = 5,                 # tournament size (optional: auto if None)
+                 mutation_rate: float = 0.8,       # probability to mutate a selected parent 
+                 crossover_rate: float = 0.8,      # probability to recombine two parents 
                  feasible_retry: int = 20,         # retries to obtain a feasible variation
                  greedy_search_replacement_prob: float = 0.2 # probability to apply greedy search replacement (as percentage of worst population)
                  ):
@@ -636,7 +674,7 @@ class r1072969:
         improved_offspring: list[np.ndarray] = []
 
         # --- Budget ---
-        p_ls = 0.6             # apply LS only to 40% of children
+        p_ls = 0.4             # apply LS only to 40% of children
         max_evals = 50_000     # increased to allow full search
         max_moves = 2_000       # effectively uncap moves so it finds the local optimum
         time_cap_ms = 50        # increased time cap per individual
@@ -672,23 +710,56 @@ class r1072969:
     # ---- Elimination ----
     def elimination(self, joined_population: list[np.ndarray], joined_fitnesses: np.ndarray, distanceMatrix: np.ndarray) -> Tuple:
         """ 
-            (μ+λ) Elimination with duplicate filtering 
+            (μ+λ) Elimination with duplicate filtering and Tournament Selection 
         """
         mu = self.mu
         
+        # 1. Sort by fitness and remove duplicates to form the candidate pool
         order_indices = np.argsort(joined_fitnesses, kind='mergesort')
         sorted_population = [joined_population[i] for i in order_indices]
-        sorted_fitnesses = joined_fitnesses[order_indices]
+        sorted_fitnesses = joined_fitnesses[order_indices] # Sorted ascending (best to worst)
 
-        sorted_population = self._unique_by_tuple(sorted_population) # Remove duplicates to preserve some diversity
-        # Recompute fitness for the filtered ordering
-        sorted_fitnesses = self._compute_fitness_population(sorted_population, distanceMatrix)
-
-        # Keep top μ
-        population = sorted_population[:mu]
-        population_fitnesses = sorted_fitnesses[:mu]
+        # Unique filtering (optional but good for diversity)
+        # Note: This might reduce the pool size below mu if many duplicates exist, 
+        # so we must be careful. Ideally, we have enough λ to cover it.
+        unique_population = []
+        unique_fitnesses = []
+        seen = set()
+        for i, tour in enumerate(sorted_population):
+            key = tuple(map(int, tour))
+            if key not in seen:
+                seen.add(key)
+                unique_population.append(tour)
+                unique_fitnesses.append(sorted_fitnesses[i])
         
-        return population, population_fitnesses
+        # Convert back to numpy array for easier indexing in tournament
+        pool_fitnesses = np.array(unique_fitnesses, dtype=float)
+        pool_population = unique_population
+        
+        if len(pool_population) < mu:
+            # If we eliminated too many, we might need to pad with randoms (unlikely with reasonable lambda)
+            # or just take what we have.
+            # For simplicity, if we somehow have fewer unique individuals than mu, just return them all.
+            return pool_population, pool_fitnesses
+
+        # 2. Elitism: Keep the absolute best 1 (or small k)
+        new_population = [pool_population[0]]
+        new_fitnesses = [pool_fitnesses[0]]
+        
+        # 3. Fill the rest of the mu slots with Tournament Selection
+        # We need to fill (mu - 1) slots
+        needed = mu - 1
+        
+        # We can pick from the entire unique pool (including the elite one, it doesn't hurt)
+        # or exclude it. Usually standard tournament picks from the whole pool.
+        
+        # NOTE: self._tournament_select_idx returns an INDEX into the fitness array provided
+        while len(new_population) < mu:
+            winner_idx = self._tournament_select_idx(pool_fitnesses, k=3)
+            new_population.append(pool_population[winner_idx])
+            new_fitnesses.append(pool_fitnesses[winner_idx])
+            
+        return new_population, np.array(new_fitnesses)
 
 
     # ==========================
@@ -702,10 +773,27 @@ class r1072969:
         file.close()
         
         D = distanceMatrix
+        
+        n = D.shape[0]
+        if 1 <= n <= 60:
+            self.mu = 100 
+            self.lamb = 100
+        elif 61 <= n <= 260:
+            self.mu = 150 
+            self.lamb = 150
+        elif 261 <= n <= 510:
+            self.mu = 350 
+            self.lamb = 350
+        elif 511 <= n <= 800:
+            self.mu = 450 
+            self.lamb = 450
+        else:
+            self.mu = 500
+            self.lamb = 500
 
         # --- Initialisation ---
         population = self.initialisation(D)
-
+        print(len(population))
         population_fitnesses = self._compute_fitness_population(population, D)
         best_idx = int(np.argmin(population_fitnesses))
         best_tour = population[best_idx].copy()
@@ -718,7 +806,7 @@ class r1072969:
         # ===== Evolutionary loop =====
         self.best_fitness_history = []
         self.stagnation_counter = 0
-        STAGNATION_LIMIT = 5
+        STAGNATION_LIMIT = 10
         
         yourConvergenceTestsHere = True
         while yourConvergenceTestsHere:
@@ -764,7 +852,7 @@ class r1072969:
                 
             # Apply 3-opt if stagnated
             if self.stagnation_counter >= STAGNATION_LIMIT:
-                print(f"Stagnation detected ({self.stagnation_counter} gens). Applying 3-opt to top individuals.")
+                #print(f"Stagnation detected ({self.stagnation_counter} gens). Applying 3-opt to top individuals.")
                 self.stagnation_counter = 0 # reset or keep counting? Reset to give it time to work.
                 
                 # Apply 3-opt to the best half of population to try and break out
@@ -942,12 +1030,19 @@ class r1072969:
             i, j = j, i
         return fast_mutate_invert(tour, i, j)
 
+    def _mutate_insert(self, tour: np.ndarray) -> np.ndarray:
+        """
+            Pick a city at random and insert it at another random position
+        """
+        i, j = self.rng.choice(tour.size, size=2, replace=False)
+        return fast_mutate_insert(tour, i, j)
+
     def _mutate_feasible(self, parent: np.ndarray, D: np.ndarray) -> np.ndarray:
         """
             Try up to `feasible_retry` times to produce a mutated child with finite length
             If unsuccessful, return the parent
         """
-        ops = (self._mutate_swap, self._mutate_invert)
+        ops = (self._mutate_swap, self._mutate_invert, self._mutate_insert)
         for _ in range(self.feasible_retry):
             op = self.rng.choice(ops)
             child = op(parent)
@@ -1188,9 +1283,9 @@ if __name__ == '__main__':
 
     #start_time = time.perf_counter()
 
-    a = r1072969(mu=500, lamb=500, k_tournament=5, mutation_rate=0.8, crossover_rate=0.5)
+    a = r1072969()
 
-    a.optimize("./tour1000.csv")
+    a.optimize("./tour250.csv")
     
     #end_time = time.perf_counter()
 
