@@ -1,3 +1,4 @@
 # Memetic-Algorithm-Traveling-Salesman-Problem
 
-Report in r1072969_final.pdf
+- Project report in r1072969_final.pdf
+- Main algorithm class in TSP.py
